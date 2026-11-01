@@ -19,7 +19,7 @@
 //                 command API (for example "/hue/lights/off")
 //                 or a full URL.
 //
-// Web API (doGet):
+// Web API (doGet, legacy and anonymous, used by ha.ze.gs):
 //   time     "HH:MM" or "HH:MM:SS" (today), or "YYYYMMDD-HH:MM".
 //   cmd      A command. Repeat the parameter to register up to 10.
 //   text     Legacy speech text. When no cmd is given, one default
@@ -28,6 +28,16 @@
 //            with no text at all, the alarm just announces the time
 //            (for example "7時30分です。"), also like the old version.
 //   callback Legacy JSONP callback name.
+//
+// Web API (doPost, JSON body, used by the alarm frontend):
+//   Every action requires a Google ID token in "idToken"; the token
+//   is verified and its email must be in the AVAILABLE_GMAILS script
+//   property (the same scheme as the other private sites). The OAuth
+//   client ID used for verification is GOOGLE_OAUTH_CLIENT_ID.
+//   { action: "list" }   -> the registered alarms.
+//   { action: "set", time, commands } or { ..., text }
+//                        -> register (or overwrite) an alarm.
+//   { action: "delete", time } -> remove the alarm for that minute.
 //
 // A request for a datetime that already exists overwrites that row.
 // A request for a past datetime is rejected with an error.
@@ -156,12 +166,19 @@ export const doGet = (e) => {
       error: `too many commands: max is ${MAX_COMMANDS}`,
     });
   }
+  upsertAlarm_(target, commands);
+  return respond_(e, { ok: true, time: formatTarget_(target), commands: commands.length });
+};
 
+// Write one alarm row, overwriting the row for the same minute when
+// one already exists.
+export const upsertAlarm_ = (target, commands) => {
   const lock = LockService.getScriptLock();
   lock.waitLock(10000);
   try {
     const sheet = SpreadsheetApp.getActiveSheet();
     const values = sheet.getDataRange().getValues();
+    const now = new Date();
     let rowIndex = -1;
     values.forEach((row, i) => {
       const d = normalizeCellDate_(row[0], now);
@@ -169,7 +186,6 @@ export const doGet = (e) => {
     });
     const rowValues = [target].concat(commands);
     if (rowIndex >= 0) {
-      // Overwrite the existing row for this datetime.
       sheet.getRange(rowIndex + 1, 1, 1, MAX_COMMANDS + 1).clearContent();
       sheet.getRange(rowIndex + 1, 1, 1, rowValues.length).setValues([rowValues]);
     } else {
@@ -178,7 +194,147 @@ export const doGet = (e) => {
   } finally {
     lock.releaseLock();
   }
-  return respond_(e, { ok: true, time: formatTarget_(target), commands: commands.length });
+};
+
+// The registered alarms as [{ target, commands }], oldest first.
+// Rows whose first cell is not a readable date are skipped.
+export const readAlarms_ = () => {
+  const sheet = SpreadsheetApp.getActiveSheet();
+  const values = sheet.getDataRange().getValues();
+  const now = new Date();
+  const alarms = [];
+  values.forEach((row) => {
+    const target = normalizeCellDate_(row[0], now);
+    if (!target) return;
+    const commands = row
+      .slice(1)
+      .map((c) => String(c == null ? '' : c).trim())
+      .filter((c) => c.length > 0);
+    alarms.push({ target, commands });
+  });
+  alarms.sort((a, b) => a.target.getTime() - b.target.getTime());
+  return alarms;
+};
+
+// Remove the alarm row for the target minute. Returns true when a
+// row was removed.
+export const deleteAlarm_ = (target) => {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    const sheet = SpreadsheetApp.getActiveSheet();
+    const values = sheet.getDataRange().getValues();
+    const now = new Date();
+    for (let i = 0; i < values.length; i++) {
+      const d = normalizeCellDate_(values[i][0], now);
+      if (d && sameMinute_(d, target)) {
+        sheet.deleteRow(i + 1);
+        return true;
+      }
+    }
+    return false;
+  } finally {
+    lock.releaseLock();
+  }
+};
+
+// --- Authentication for doPost (same scheme as the other private
+// sites: verify the Google ID token, then check the allowlist) ---
+
+const allowedEmails_ = () =>
+  (getProperty_('AVAILABLE_GMAILS') || '')
+    .split(',')
+    .map((v) => v.trim().toLowerCase())
+    .filter((v) => v.length > 0);
+
+// Throws an Error when the token is missing, invalid, or not allowed.
+export const verifyIdToken_ = (idToken) => {
+  if (!idToken) throw new Error('missing id token');
+  const clientId = getProperty_('GOOGLE_OAUTH_CLIENT_ID');
+  const res = UrlFetchApp.fetch(
+    'https://oauth2.googleapis.com/tokeninfo?id_token=' + encodeURIComponent(idToken),
+    { muteHttpExceptions: true }
+  );
+  if (res.getResponseCode() !== 200) throw new Error('token verification failed');
+  const payload = JSON.parse(res.getContentText());
+  if (payload.iss !== 'accounts.google.com' && payload.iss !== 'https://accounts.google.com') {
+    throw new Error('invalid iss');
+  }
+  if (payload.aud !== clientId) throw new Error('invalid aud');
+  const exp = Number(payload.exp || 0);
+  if (!exp || exp * 1000 <= Date.now()) throw new Error('token expired');
+  if (payload.email_verified !== true && payload.email_verified !== 'true') {
+    throw new Error('email not verified');
+  }
+  const email = String(payload.email || '').toLowerCase();
+  if (!email) throw new Error('missing email');
+  if (!allowedEmails_().includes(email)) throw new Error('forbidden email');
+  return email;
+};
+
+// Commands for a doPost "set" body: an explicit commands array wins;
+// otherwise fall back to one speech command (text may be empty).
+export const collectBodyCommands_ = (body, target) => {
+  let cmds = [];
+  if (Array.isArray(body.commands)) {
+    cmds = body.commands.map((c) => String(c).trim()).filter((c) => c.length > 0);
+  }
+  if (cmds.length === 0) {
+    const text = body.text ? String(body.text).trim() : '';
+    cmds = [defaultSpeechCommand_(target, text)];
+  }
+  return cmds;
+};
+
+const jsonOut_ = (payload) => {
+  const output = ContentService.createTextOutput();
+  output.setMimeType(ContentService.MimeType.JSON);
+  output.setContent(JSON.stringify(payload));
+  return output;
+};
+
+export const doPost = (e) => {
+  let body;
+  try {
+    body = JSON.parse((e && e.postData && e.postData.contents) || '');
+  } catch (err) {
+    return jsonOut_({ ok: false, error: 'invalid JSON body' });
+  }
+  try {
+    verifyIdToken_(body.idToken);
+  } catch (err) {
+    const message = (err && err.message) || 'unauthorized';
+    return jsonOut_({ ok: false, status: message === 'forbidden email' ? 403 : 401, error: message });
+  }
+
+  if (body.action === 'list') {
+    return jsonOut_({
+      ok: true,
+      alarms: readAlarms_().map((a) => ({ time: formatTarget_(a.target), commands: a.commands })),
+    });
+  }
+
+  if (body.action === 'delete' || body.action === 'set') {
+    const now = new Date();
+    const target = parseTarget_(body.time || '', now);
+    if (!target) {
+      return jsonOut_({ ok: false, error: 'invalid time format: use HH:MM or YYYYMMDD-HH:MM' });
+    }
+    if (body.action === 'delete') {
+      return jsonOut_({ ok: true, deleted: deleteAlarm_(target) ? 1 : 0 });
+    }
+    if (target.getTime() <= now.getTime()) {
+      return jsonOut_({ ok: false, error: 'time is in the past' });
+    }
+    const commands = collectBodyCommands_(body, target);
+    if (commands.length > MAX_COMMANDS) {
+      return jsonOut_({ ok: false, error: `too many commands: max is ${MAX_COMMANDS}` });
+    }
+    upsertAlarm_(target, commands);
+    return jsonOut_({ ok: true, time: formatTarget_(target), commands: commands.length });
+  }
+
+  return jsonOut_({ ok: false, error: 'unknown action' });
 };
 
 // A sheet cell -> Date (or null). Time-only values left by the old
