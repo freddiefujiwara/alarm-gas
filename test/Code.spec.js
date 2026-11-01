@@ -31,7 +31,52 @@ const mockSheet = {
   })),
 };
 
-global.SpreadsheetApp = { getActiveSheet: vi.fn(() => mockSheet) };
+global.SpreadsheetApp = {
+  getActiveSheet: vi.fn(() => mockSheet),
+  getActiveSpreadsheet: vi.fn(() => mockSpreadsheet),
+};
+
+// ---- Share session mocks (mirror the health-gas test stubs) ----
+let uuidCounter = 0;
+let shareValues;
+let shareSheetExists;
+let shareInserted;
+
+const mockShareSheet = {
+  getDataRange: vi.fn(() => ({ getValues: vi.fn(() => shareValues) })),
+  appendRow: vi.fn((row) => shareValues.push([...row])),
+  getRange: vi.fn((row, col) => ({
+    setValue: vi.fn((value) => {
+      shareValues[row - 1][col - 1] = value;
+    }),
+  })),
+};
+
+const mockSpreadsheet = {
+  getSheetByName: vi.fn((name) =>
+    name === "share_sessions" ? (shareSheetExists ? mockShareSheet : null) : null
+  ),
+  insertSheet: vi.fn(() => {
+    shareSheetExists = true;
+    shareInserted += 1;
+    return mockShareSheet;
+  }),
+};
+
+global.Utilities = {
+  DigestAlgorithm: { SHA_256: "SHA_256" },
+  computeDigest: vi.fn((algo, str) =>
+    Array.from({ length: 32 }, (_, i) => String(str).charCodeAt(i % String(str).length) % 128)
+  ),
+  getUuid: vi.fn(
+    () => `00000000-0000-4000-8000-${String(++uuidCounter).padStart(12, "0")}`
+  ),
+};
+
+const shareHashOf = (token) =>
+  Array.from({ length: 32 }, (_, i) => token.charCodeAt(i % token.length) % 128)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 global.ContentService = {
   createTextOutput: vi.fn(() => ({
     setMimeType: vi.fn((m) => {
@@ -83,6 +128,12 @@ beforeEach(() => {
   fetched = [];
   outputContent = null;
   outputMime = null;
+  uuidCounter = 0;
+  shareSheetExists = true;
+  shareInserted = 0;
+  shareValues = [
+    ["token_hash", "issued_at", "expires_at", "revoked_at", "access_count", "last_accessed_at"],
+  ];
   tokenInfo = {
     code: 200,
     payload: {
@@ -366,5 +417,153 @@ describe("doPost", () => {
   it("rejects invalid JSON", () => {
     doPost({ postData: { contents: "not json" } });
     expect(resultJson().ok).toBe(false);
+  });
+});
+
+describe("doPost share sessions", () => {
+  const post = (body) => doPost({ postData: { contents: JSON.stringify(body) } });
+  const auth = { idToken: "dummy-token" };
+  const issueToken = () => {
+    post({ ...auth, action: "issue_share" });
+    return resultJson().share_token;
+  };
+
+  it("requires an ID token to issue a share session", () => {
+    post({ action: "issue_share" });
+    expect(resultJson().ok).toBe(false);
+    expect(resultJson().status).toBe(401);
+    expect(shareValues).toHaveLength(1);
+  });
+
+  it("issues a 30-day share session and stores only its hash", () => {
+    const before = Date.now();
+    post({ ...auth, action: "issue_share" });
+    const result = resultJson();
+    expect(result.ok).toBe(true);
+    expect(result.ttl_seconds).toBe(30 * 24 * 60 * 60);
+    expect(result.share_token).toMatch(/^[0-9a-f]{64}$/);
+    expect(Date.parse(result.expires_at) - before).toBeGreaterThan(29 * 24 * 60 * 60 * 1000);
+    expect(Date.parse(result.expires_at) - before).toBeLessThanOrEqual(
+      30 * 24 * 60 * 60 * 1000 + 5000
+    );
+    expect(shareValues).toHaveLength(2);
+    expect(shareValues[1][0]).toBe(shareHashOf(result.share_token));
+    expect(shareValues[1][0]).not.toBe(result.share_token);
+    expect(shareValues[1][4]).toBe(0);
+  });
+
+  it("creates the share sheet with headers when it does not exist yet", () => {
+    shareValues = [];
+    shareSheetExists = false;
+    post({ ...auth, action: "issue_share" });
+    expect(resultJson().ok).toBe(true);
+    expect(shareInserted).toBe(1);
+    expect(shareValues[0]).toEqual([
+      "token_hash",
+      "issued_at",
+      "expires_at",
+      "revoked_at",
+      "access_count",
+      "last_accessed_at",
+    ]);
+    expect(shareValues).toHaveLength(2);
+  });
+
+  it("revokes the previous session when a new one is issued", () => {
+    const first = issueToken();
+    const second = issueToken();
+    expect(first).not.toBe(second);
+    expect(shareValues[1][3]).not.toBe("");
+    expect(shareValues[2][3]).toBe("");
+    post({ action: "list", share_token: first });
+    expect(resultJson()).toEqual({
+      ok: false,
+      status: 401,
+      error: "share session expired or invalid",
+    });
+  });
+
+  it("lists alarms with a valid share token and counts the access", () => {
+    const token = issueToken();
+    sheetValues = [[new Date(2999, 0, 1, 4, 50, 0), "/speak/x"]];
+    post({ action: "list", share_token: token });
+    const result = resultJson();
+    expect(result.ok).toBe(true);
+    expect(result.alarms).toEqual([{ time: "29990101-04:50", commands: ["/speak/x"] }]);
+    expect(result._share.expires_at).toBe(shareValues[1][2]);
+    expect(shareValues[1][4]).toBe(1);
+    expect(shareValues[1][5]).not.toBe("");
+  });
+
+  it("lets a share token register and delete alarms (owner-equivalent)", () => {
+    const token = issueToken();
+    post({ action: "set", share_token: token, time: "29990101-04:50", commands: ["/a"] });
+    expect(resultJson().ok).toBe(true);
+    expect(appended).toHaveLength(1);
+    expect(appended[0].slice(1)).toEqual(["/a"]);
+    sheetValues = [[new Date(2999, 0, 1, 4, 50, 0), "/a"]];
+    post({ action: "delete", share_token: token, time: "29990101-04:50" });
+    expect(resultJson()).toEqual({
+      ok: true,
+      deleted: 1,
+      _share: { expires_at: shareValues[1][2] },
+    });
+    expect(deletedRows).toEqual([1]);
+  });
+
+  it("rejects an expired share token", () => {
+    const token = "expired-token";
+    shareValues.push([
+      shareHashOf(token),
+      new Date(Date.now() - 3600_000).toISOString(),
+      new Date(Date.now() - 1800_000).toISOString(),
+      "",
+      0,
+      "",
+    ]);
+    post({ action: "list", share_token: token });
+    expect(resultJson().ok).toBe(false);
+    expect(resultJson().status).toBe(401);
+  });
+
+  it("rejects a revoked share token", () => {
+    const token = "revoked-token";
+    shareValues.push([
+      shareHashOf(token),
+      new Date().toISOString(),
+      new Date(Date.now() + 1800_000).toISOString(),
+      new Date().toISOString(),
+      0,
+      "",
+    ]);
+    post({ action: "list", share_token: token });
+    expect(resultJson().ok).toBe(false);
+    expect(resultJson().status).toBe(401);
+  });
+
+  it("rejects an unknown share token", () => {
+    post({ action: "list", share_token: "no-such-token" });
+    expect(resultJson()).toEqual({
+      ok: false,
+      status: 401,
+      error: "share session expired or invalid",
+    });
+  });
+
+  it("revokes the active session via the revoke action", () => {
+    const token = issueToken();
+    post({ ...auth, action: "revoke_share" });
+    expect(resultJson()).toEqual({ ok: true, revoked: true });
+    post({ action: "list", share_token: token });
+    expect(resultJson().ok).toBe(false);
+    expect(resultJson().status).toBe(401);
+  });
+
+  it("does not let a share token issue more share sessions", () => {
+    const token = issueToken();
+    post({ action: "issue_share", share_token: token });
+    expect(resultJson().ok).toBe(false);
+    expect(resultJson().status).toBe(401);
+    expect(shareValues).toHaveLength(2);
   });
 });

@@ -30,7 +30,7 @@
 //   callback Legacy JSONP callback name.
 //
 // Web API (doPost, JSON body, used by the alarm frontend):
-//   Every action requires a Google ID token in "idToken"; the token
+//   Actions require a Google ID token in "idToken"; the token
 //   is verified and its email must be in the AVAILABLE_GMAILS script
 //   property (the same scheme as the other private sites). The OAuth
 //   client ID used for verification is GOOGLE_OAUTH_CLIENT_ID.
@@ -38,6 +38,12 @@
 //   { action: "set", time, commands } or { ..., text }
 //                        -> register (or overwrite) an alarm.
 //   { action: "delete", time } -> remove the alarm for that minute.
+//   { action: "issue_share" }  -> issue a temporary access link.
+//   { action: "revoke_share" } -> revoke the active access links.
+//   As an alternative to "idToken", the list/set/delete actions also
+//   accept a "share_token" from an issued access link. A share token
+//   has the same rights as the owner (it can register and delete
+//   alarms); share-authenticated responses carry "_share.expires_at".
 //
 // A request for a datetime that already exists overwrites that row.
 // A request for a past datetime is rejected with an error.
@@ -276,6 +282,119 @@ export const verifyIdToken_ = (idToken) => {
   return email;
 };
 
+// --- Temporary share sessions (temporary access links) ---
+// A logged-in owner can issue a URL token that grants the same access
+// as the owner for SHARE_TTL_SECONDS without a Google account (the
+// link is handed to a trusted agent to operate the alarms). Sessions
+// are stored in a dedicated sheet in this spreadsheet (token hashes
+// only, never raw tokens), which doubles as an audit log. The alarm
+// code only ever reads the first sheet, so the share sheet is never
+// exposed as alarm data.
+
+const SHARE_SHEET_NAME = 'share_sessions';
+// One month, so the owner can hand the link over well in advance.
+const SHARE_TTL_SECONDS = 30 * 24 * 60 * 60;
+const SHARE_HEADERS = [
+  'token_hash',
+  'issued_at',
+  'expires_at',
+  'revoked_at',
+  'access_count',
+  'last_accessed_at',
+];
+
+export const getShareSheet_ = () => {
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = spreadsheet.getSheetByName(SHARE_SHEET_NAME);
+  if (!sheet) {
+    sheet = spreadsheet.insertSheet(SHARE_SHEET_NAME);
+    sheet.appendRow(SHARE_HEADERS);
+  }
+  return sheet;
+};
+
+export const hashShareToken_ = (token) =>
+  Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, String(token))
+    .map((byte) => ((byte % 256) + 256) % 256)
+    .map((byte) => byte.toString(16).padStart(2, '0'))
+    .join('');
+
+export const readShareRows_ = () => {
+  const sheet = getShareSheet_();
+  const values = sheet.getDataRange().getValues();
+  return { sheet, values };
+};
+
+export const shareCellIso_ = (value) => {
+  if (!value) {
+    return '';
+  }
+  if (value instanceof Date) {
+    return value.toISOString();
+  }
+  return String(value);
+};
+
+export const revokeActiveShareSessions_ = (nowIso) => {
+  const { sheet, values } = readShareRows_();
+  values.forEach((row, index) => {
+    if (index === 0) {
+      return;
+    }
+    const revokedAt = shareCellIso_(row[3]);
+    const expiresAt = shareCellIso_(row[2]);
+    if (!revokedAt && expiresAt && expiresAt > nowIso) {
+      sheet.getRange(index + 1, 4).setValue(nowIso);
+    }
+  });
+};
+
+export const issueShareSession_ = () => {
+  const now = new Date();
+  const nowIso = now.toISOString();
+  const expiresIso = new Date(now.getTime() + SHARE_TTL_SECONDS * 1000).toISOString();
+  revokeActiveShareSessions_(nowIso);
+  const token = (Utilities.getUuid() + Utilities.getUuid()).replace(/-/g, '');
+  getShareSheet_().appendRow([hashShareToken_(token), nowIso, expiresIso, '', 0, '']);
+  return {
+    share_token: token,
+    issued_at: nowIso,
+    expires_at: expiresIso,
+    ttl_seconds: SHARE_TTL_SECONDS,
+  };
+};
+
+export const revokeShareSession_ = () => {
+  revokeActiveShareSessions_(new Date().toISOString());
+  return { revoked: true };
+};
+
+export const validateShareToken_ = (token) => {
+  if (!token) {
+    return null;
+  }
+  const hash = hashShareToken_(token);
+  const { sheet, values } = readShareRows_();
+  const nowIso = new Date().toISOString();
+  for (let index = 1; index < values.length; index += 1) {
+    const row = values[index];
+    if (row[0] !== hash) {
+      continue;
+    }
+    if (shareCellIso_(row[3])) {
+      return null;
+    }
+    const expiresAt = shareCellIso_(row[2]);
+    if (!expiresAt || expiresAt <= nowIso) {
+      return null;
+    }
+    sheet.getRange(index + 1, 5).setValue(Number(row[4] || 0) + 1);
+    sheet.getRange(index + 1, 6).setValue(nowIso);
+    return { expires_at: expiresAt };
+  }
+  return null;
+};
+
 // Commands for a doPost "set" body: an explicit commands array wins;
 // otherwise fall back to one speech command (text may be empty).
 export const collectBodyCommands_ = (body, target) => {
@@ -297,6 +416,11 @@ const jsonOut_ = (payload) => {
   return output;
 };
 
+const authError_ = (err) => {
+  const message = (err && err.message) || 'unauthorized';
+  return jsonOut_({ ok: false, status: message === 'forbidden email' ? 403 : 401, error: message });
+};
+
 export const doPost = (e) => {
   let body;
   try {
@@ -304,18 +428,44 @@ export const doPost = (e) => {
   } catch (err) {
     return jsonOut_({ ok: false, error: 'invalid JSON body' });
   }
-  try {
-    verifyIdToken_(body.idToken);
-  } catch (err) {
-    const message = (err && err.message) || 'unauthorized';
-    return jsonOut_({ ok: false, status: message === 'forbidden email' ? 403 : 401, error: message });
+
+  // Issuing and revoking access links always requires the owner's
+  // Google ID token; a share token cannot mint more share tokens.
+  if (body.action === 'issue_share' || body.action === 'revoke_share') {
+    try {
+      verifyIdToken_(body.idToken);
+    } catch (err) {
+      return authError_(err);
+    }
+    const result = body.action === 'issue_share' ? issueShareSession_() : revokeShareSession_();
+    return jsonOut_({ ok: true, ...result });
   }
 
+  // The remaining actions accept either the owner's ID token or a
+  // share token from an issued access link (owner-equivalent).
+  let shareSession = null;
+  if (body.share_token) {
+    shareSession = validateShareToken_(body.share_token);
+    if (!shareSession) {
+      return jsonOut_({ ok: false, status: 401, error: 'share session expired or invalid' });
+    }
+  } else {
+    try {
+      verifyIdToken_(body.idToken);
+    } catch (err) {
+      return authError_(err);
+    }
+  }
+  const out = (payload) =>
+    shareSession ? { ...payload, _share: { expires_at: shareSession.expires_at } } : payload;
+
   if (body.action === 'list') {
-    return jsonOut_({
-      ok: true,
-      alarms: readAlarms_().map((a) => ({ time: formatTarget_(a.target), commands: a.commands })),
-    });
+    return jsonOut_(
+      out({
+        ok: true,
+        alarms: readAlarms_().map((a) => ({ time: formatTarget_(a.target), commands: a.commands })),
+      })
+    );
   }
 
   if (body.action === 'delete' || body.action === 'set') {
@@ -325,7 +475,7 @@ export const doPost = (e) => {
       return jsonOut_({ ok: false, error: 'invalid time format: use HH:MM or YYYYMMDD-HH:MM' });
     }
     if (body.action === 'delete') {
-      return jsonOut_({ ok: true, deleted: deleteAlarm_(target) ? 1 : 0 });
+      return jsonOut_(out({ ok: true, deleted: deleteAlarm_(target) ? 1 : 0 }));
     }
     if (target.getTime() <= now.getTime()) {
       return jsonOut_({ ok: false, error: 'time is in the past' });
@@ -335,7 +485,7 @@ export const doPost = (e) => {
       return jsonOut_({ ok: false, error: `too many commands: max is ${MAX_COMMANDS}` });
     }
     upsertAlarm_(target, commands);
-    return jsonOut_({ ok: true, time: formatTarget_(target), commands: commands.length });
+    return jsonOut_(out({ ok: true, time: formatTarget_(target), commands: commands.length }));
   }
 
   return jsonOut_({ ok: false, error: 'unknown action' });
