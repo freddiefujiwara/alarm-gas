@@ -22,9 +22,11 @@
 // Web API (doGet):
 //   time     "HH:MM" or "HH:MM:SS" (today), or "YYYYMMDD-HH:MM".
 //   cmd      A command. Repeat the parameter to register up to 10.
-//   text     Legacy speech text. When no cmd is given and text is
-//            present, one default speech command for the Nest speaker
-//            is registered instead, like the old version did.
+//   text     Legacy speech text. When no cmd is given, one default
+//            speech command for the Nest speaker is registered
+//            instead, like the old version did. The text is optional:
+//            with no text at all, the alarm just announces the time
+//            (for example "7時30分です。"), also like the old version.
 //   callback Legacy JSONP callback name.
 //
 // A request for a datetime that already exists overwrites that row.
@@ -100,8 +102,9 @@ export const buildSpeechText_ = (target, text) =>
 export const defaultSpeechCommand_ = (target, text) =>
   defaultSpeechPath_() + encodeURIComponent(buildSpeechText_(target, text));
 
-// Commands from the request. Falls back to one default speech command
-// when only the legacy "text" parameter is present.
+// Commands from the request. When no cmd is given, this falls back
+// to one default speech command: with the legacy "text" when present,
+// or a time-only announcement when it is not (the old behavior).
 export const collectRequestCommands_ = (e, target) => {
   const params = (e && e.parameters) || {};
   let cmds = [];
@@ -112,10 +115,9 @@ export const collectRequestCommands_ = (e, target) => {
   }
   cmds = cmds.map((c) => String(c).trim()).filter((c) => c.length > 0);
   if (cmds.length === 0) {
-    const text = e && e.parameter ? e.parameter.text : null;
-    if (text && String(text).trim().length > 0) {
-      cmds = [defaultSpeechCommand_(target, String(text).trim())];
-    }
+    const raw = e && e.parameter ? e.parameter.text : null;
+    const text = raw ? String(raw).trim() : '';
+    cmds = [defaultSpeechCommand_(target, text)];
   }
   return cmds;
 };
@@ -148,9 +150,6 @@ export const doGet = (e) => {
     return respond_(e, { ok: false, error: 'time is in the past' });
   }
   const commands = collectRequestCommands_(e, target);
-  if (commands.length === 0) {
-    return respond_(e, { ok: false, error: 'no command or text given' });
-  }
   if (commands.length > MAX_COMMANDS) {
     return respond_(e, {
       ok: false,
