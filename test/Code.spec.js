@@ -127,8 +127,10 @@ describe("collectRequestCommands_", () => {
     expect(cmds).toHaveLength(1);
     expect(cmds[0]).toContain("/speak/-h/192.0.2.1/");
   });
-  it("returns empty when nothing is given", () => {
-    expect(collectRequestCommands_(ev({}), target)).toEqual([]);
+  it("falls back to a time-only announcement when nothing is given", () => {
+    const cmds = collectRequestCommands_(ev({}), target);
+    expect(cmds).toHaveLength(1);
+    expect(decodeURIComponent(cmds[0].split("/-s/")[1])).toBe("7時30分です。");
   });
 });
 
@@ -154,11 +156,16 @@ describe("doGet", () => {
     expect(resultJson().error).toContain("10");
     expect(appended).toHaveLength(0);
   });
-  it("rejects a bad format and a missing command", () => {
+  it("rejects a bad format", () => {
     doGet(ev({ time: "soon", cmd: "/x" }, { cmd: ["/x"] }));
     expect(resultJson().ok).toBe(false);
+  });
+  it("registers a time-only alarm when neither cmd nor text is given", () => {
     doGet(ev({ time: "29990101-04:50" }));
-    expect(resultJson().ok).toBe(false);
+    expect(resultJson()).toEqual({ ok: true, time: "29990101-04:50", commands: 1 });
+    expect(appended).toHaveLength(1);
+    expect(appended[0][1]).toContain("/speak/-h/192.0.2.1/");
+    expect(decodeURIComponent(appended[0][1].split("/-s/")[1])).toBe("4時50分です。");
   });
   it("overwrites an existing row for the same datetime", () => {
     const existing = new Date(2999, 0, 1, 4, 50, 0);
