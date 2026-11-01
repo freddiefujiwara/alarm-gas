@@ -52,6 +52,17 @@ global.UrlFetchApp = {
   }),
 };
 global.Logger = { log: vi.fn() };
+global.PropertiesService = {
+  getScriptProperties: vi.fn(() => ({
+    getProperty: vi.fn(
+      (name) =>
+        ({
+          API_BASE_URL: "http://home-api.example",
+          DEFAULT_SPEECH_PATH: "/speak/-h/192.0.2.1/-v/60/-s/",
+        })[name] || null
+    ),
+  })),
+};
 
 beforeEach(() => {
   sheetValues = [];
@@ -97,9 +108,9 @@ describe("speech helpers", () => {
       "1時ちょうどです。昼です"
     );
   });
-  it("builds the default Nest speech command", () => {
+  it("builds the default speech command", () => {
     const cmd = defaultSpeechCommand_(new Date(2026, 10, 2, 7, 30), "おはよう");
-    expect(cmd.startsWith("/google-home-speaker-wrapper/-h/192.168.1.22/-v/60/-s/")).toBe(true);
+    expect(cmd.startsWith("/speak/-h/192.0.2.1/-v/60/-s/")).toBe(true);
     expect(decodeURIComponent(cmd.split("/-s/")[1])).toBe("7時30分です。おはよう");
   });
 });
@@ -114,7 +125,7 @@ describe("collectRequestCommands_", () => {
     const e = ev({ text: "おはよう" });
     const cmds = collectRequestCommands_(e, target);
     expect(cmds).toHaveLength(1);
-    expect(cmds[0]).toContain("/google-home-speaker-wrapper/");
+    expect(cmds[0]).toContain("/speak/-h/192.0.2.1/");
   });
   it("returns empty when nothing is given", () => {
     expect(collectRequestCommands_(ev({}), target)).toEqual([]);
@@ -174,7 +185,7 @@ describe("classify_ and toUrl_", () => {
     expect(classify_(new Date(2026, 10, 2, 4, 52, 0), now)).toBe("keep");
   });
   it("maps commands to URLs", () => {
-    expect(toUrl_("/hue/lights/off")).toBe("http://a.ze.gs/hue/lights/off");
+    expect(toUrl_("/hue/lights/off")).toBe("http://home-api.example/hue/lights/off");
     expect(toUrl_("https://example.com/x")).toBe("https://example.com/x");
     expect(toUrl_("おはよう")).toBeNull();
   });
@@ -185,8 +196,8 @@ describe("myFunction", () => {
     sheetValues = [[new Date(), "/hue/lights/off", "/switchbot-command/-d/X/-c/turnOff"]];
     myFunction();
     expect(fetched).toEqual([
-      "http://a.ze.gs/hue/lights/off",
-      "http://a.ze.gs/switchbot-command/-d/X/-c/turnOff",
+      "http://home-api.example/hue/lights/off",
+      "http://home-api.example/switchbot-command/-d/X/-c/turnOff",
     ]);
     expect(deletedRows).toEqual([1]);
   });
@@ -202,13 +213,13 @@ describe("myFunction", () => {
     expect(fetched).toEqual([]);
     expect(deletedRows).toEqual([]);
   });
-  it("speaks a legacy [time, text] row on the Nest speaker", () => {
+  it("speaks a legacy [time, text] row with the default speech command", () => {
     const timeOnly = new Date();
     timeOnly.setFullYear(1899); // Sheets returns time-only cells like this
     sheetValues = [[timeOnly, "おはよう"]];
     myFunction();
     expect(fetched).toHaveLength(1);
-    expect(fetched[0]).toContain("http://a.ze.gs/google-home-speaker-wrapper/-h/192.168.1.22/");
+    expect(fetched[0]).toContain("http://home-api.example/speak/-h/192.0.2.1/");
     expect(deletedRows).toEqual([1]);
   });
   it("handles mixed rows and deletes from the bottom up", () => {
@@ -221,7 +232,7 @@ describe("myFunction", () => {
       [due, "/c"],
     ];
     myFunction();
-    expect(fetched).toEqual(["http://a.ze.gs/c"]);
+    expect(fetched).toEqual(["http://home-api.example/c"]);
     expect(deletedRows).toEqual([3, 1]);
   });
 });

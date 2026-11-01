@@ -3,14 +3,20 @@
 // A small alarm scheduler backed by a Google Sheets sheet.
 // A time-driven trigger runs myFunction() every minute. When a row's
 // datetime is close to now, the row's commands are sent to the home
-// command API (http://a.ze.gs) one by one, and the row is removed.
-// Rows whose datetime has already passed are removed without firing,
+// command API one by one, and the row is removed. Rows whose
+// datetime has already passed are removed without firing,
 // so the sheet cleans itself up.
+//
+// The API base URL and the default speech command prefix live in
+// script properties, not in this public source code:
+//   API_BASE_URL        Base URL of the home command API.
+//   DEFAULT_SPEECH_PATH Path prefix of the speech command used for
+//                       legacy text alarms, ending with "/-s/".
 //
 // Sheet layout (the sheet is machine-managed; there is no header row):
 //   Column A:     datetime to fire (a Date value)
-//   Columns B..K: up to 10 commands. A command is a path on
-//                 http://a.ze.gs (for example "/hue/lights/off")
+//   Columns B..K: up to 10 commands. A command is a path on the home
+//                 command API (for example "/hue/lights/off")
 //                 or a full URL.
 //
 // Web API (doGet):
@@ -19,18 +25,26 @@
 //   text     Legacy speech text. When no cmd is given and text is
 //            present, one default speech command for the Nest speaker
 //            is registered instead, like the old version did.
-//   callback Legacy JSONP callback name (used by ha.ze.gs).
+//   callback Legacy JSONP callback name.
 //
 // A request for a datetime that already exists overwrites that row.
 // A request for a past datetime is rejected with an error.
 // Note: Apps Script web apps cannot set an HTTP status code, so
 // errors are reported in the JSON body: { "ok": false, "error": "..." }.
 
-const API_BASE_URL = 'http://a.ze.gs';
 const MAX_COMMANDS = 10;
 const FIRE_WINDOW_MS = 60 * 1000;
-const NEST_SPEAKER_PATH =
-  '/google-home-speaker-wrapper/-h/192.168.1.22/-v/60/-s/';
+
+const getProperty_ = (name) => {
+  const value = PropertiesService.getScriptProperties().getProperty(name);
+  if (!value) {
+    throw new Error(`script property ${name} is not set`);
+  }
+  return value;
+};
+
+const apiBaseUrl_ = () => getProperty_('API_BASE_URL');
+const defaultSpeechPath_ = () => getProperty_('DEFAULT_SPEECH_PATH');
 
 const pad2_ = (n) => String(n).padStart(2, '0');
 
@@ -82,9 +96,9 @@ export const sameMinute_ = (a, b) =>
 export const buildSpeechText_ = (target, text) =>
   `${target.getHours() % 12 || 12}時${target.getMinutes() ? target.getMinutes() + '分' : 'ちょうど'}です。${text}`;
 
-// A command (path on http://a.ze.gs) that speaks text on the Nest speaker.
+// A speech command (path on the home command API) for legacy text.
 export const defaultSpeechCommand_ = (target, text) =>
-  NEST_SPEAKER_PATH + encodeURIComponent(buildSpeechText_(target, text));
+  defaultSpeechPath_() + encodeURIComponent(buildSpeechText_(target, text));
 
 // Commands from the request. Falls back to one default speech command
 // when only the legacy "text" parameter is present.
@@ -110,7 +124,7 @@ const respond_ = (e, payload) => {
   const output = ContentService.createTextOutput();
   const callback = e && e.parameter ? e.parameter.callback : undefined;
   if (typeof callback !== 'undefined') {
-    // Legacy JSONP shape, kept for ha.ze.gs: cb&&cb({...});
+    // Legacy JSONP shape, kept for the old frontend: cb&&cb({...});
     output.setMimeType(ContentService.MimeType.JAVASCRIPT);
     output.setContent(callback + '&&' + callback + '(' + JSON.stringify(payload) + ');');
   } else {
@@ -205,7 +219,7 @@ export const toUrl_ = (command) => {
     return command;
   }
   if (command.startsWith('/')) {
-    return API_BASE_URL + command;
+    return apiBaseUrl_() + command;
   }
   return null;
 };
@@ -251,7 +265,7 @@ export const myFunction = () => {
       });
       if (legacyTexts.length > 0) {
         // Old-format row ([time, text]): speak it like the old version.
-        urls.unshift(API_BASE_URL + defaultSpeechCommand_(target, legacyTexts.join(' ')));
+        urls.unshift(apiBaseUrl_() + defaultSpeechCommand_(target, legacyTexts.join(' ')));
       }
       urls.slice(0, MAX_COMMANDS).forEach((url) => {
         const res = UrlFetchApp.fetch(url, {
