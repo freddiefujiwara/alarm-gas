@@ -128,6 +128,11 @@ describe("speech helpers", () => {
       "1時ちょうどです。昼です"
     );
   });
+  it("nudges instead when the text is empty", () => {
+    expect(buildSpeechText_(new Date(2026, 10, 2, 7, 30), "")).toBe(
+      "7時30分です。時間ですよ。時間ですよ。そろそろ時間ですよ。"
+    );
+  });
   it("builds the default speech command", () => {
     const cmd = defaultSpeechCommand_(new Date(2026, 10, 2, 7, 30), "おはよう");
     expect(cmd.startsWith("/speak/-h/192.0.2.1/-v/60/-s/")).toBe(true);
@@ -147,10 +152,12 @@ describe("collectRequestCommands_", () => {
     expect(cmds).toHaveLength(1);
     expect(cmds[0]).toContain("/speak/-h/192.0.2.1/");
   });
-  it("falls back to a time-only announcement when nothing is given", () => {
+  it("falls back to the time announcement when nothing is given", () => {
     const cmds = collectRequestCommands_(ev({}), target);
     expect(cmds).toHaveLength(1);
-    expect(decodeURIComponent(cmds[0].split("/-s/")[1])).toBe("7時30分です。");
+    expect(decodeURIComponent(cmds[0].split("/-s/")[1])).toBe(
+      "7時30分です。時間ですよ。時間ですよ。そろそろ時間ですよ。"
+    );
   });
 });
 
@@ -180,12 +187,14 @@ describe("doGet", () => {
     doGet(ev({ time: "soon", cmd: "/x" }, { cmd: ["/x"] }));
     expect(resultJson().ok).toBe(false);
   });
-  it("registers a time-only alarm when neither cmd nor text is given", () => {
+  it("registers a time announcement alarm when neither cmd nor text is given", () => {
     doGet(ev({ time: "29990101-04:50" }));
     expect(resultJson()).toEqual({ ok: true, time: "29990101-04:50", commands: 1 });
     expect(appended).toHaveLength(1);
     expect(appended[0][1]).toContain("/speak/-h/192.0.2.1/");
-    expect(decodeURIComponent(appended[0][1].split("/-s/")[1])).toBe("4時50分です。");
+    expect(decodeURIComponent(appended[0][1].split("/-s/")[1])).toBe(
+      "4時50分です。時間ですよ。時間ですよ。そろそろ時間ですよ。"
+    );
   });
   it("overwrites an existing row for the same datetime", () => {
     const existing = new Date(2999, 0, 1, 4, 50, 0);
@@ -320,13 +329,15 @@ describe("doPost", () => {
     expect(appended[0].slice(1)).toEqual(["/a", "/b"]);
   });
 
-  it("registers a speech alarm from text, or a time-only one without", () => {
+  it("registers a speech alarm from text, or a time announcement without", () => {
     post({ ...auth, action: "set", time: "29990101-04:50", text: "おはよう" });
     expect(resultJson().ok).toBe(true);
     expect(decodeURIComponent(appended[0][1].split("/-s/")[1])).toBe("4時50分です。おはよう");
     post({ ...auth, action: "set", time: "29990101-05:00" });
     expect(resultJson().ok).toBe(true);
-    expect(decodeURIComponent(appended[1][1].split("/-s/")[1])).toBe("5時ちょうどです。");
+    expect(decodeURIComponent(appended[1][1].split("/-s/")[1])).toBe(
+      "5時ちょうどです。時間ですよ。時間ですよ。そろそろ時間ですよ。"
+    );
   });
 
   it("rejects a past time, too many commands, and unknown actions", () => {
