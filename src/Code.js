@@ -368,13 +368,21 @@ export const normalizeCellDate_ = (value, now) => {
 };
 
 // A command cell -> full URL, or null when the cell is legacy speech
-// text (anything that is neither a path nor a URL).
+// text. Commands come in two forms:
+// - path form:  "/switchbot-command/-d/X/-c/turnOff"
+// - space form: "switchbot-command -d X -c turnOff" (what the alarm
+//   page sends now; the first token is the ASCII command name, so
+//   Japanese speech text is never mistaken for a command)
 export const toUrl_ = (command) => {
   if (command.startsWith('http://') || command.startsWith('https://')) {
     return command;
   }
   if (command.startsWith('/')) {
     return apiBaseUrl_() + command;
+  }
+  const tokens = command.trim().split(/ +/).filter((t) => t.length > 0);
+  if (tokens.length >= 2 && /^[A-Za-z0-9][A-Za-z0-9-]*$/.test(tokens[0])) {
+    return apiBaseUrl_() + '/' + tokens.join('/');
   }
   return null;
 };

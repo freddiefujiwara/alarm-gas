@@ -216,6 +216,16 @@ describe("classify_ and toUrl_", () => {
     expect(toUrl_("https://example.com/x")).toBe("https://example.com/x");
     expect(toUrl_("おはよう")).toBeNull();
   });
+  it("maps the space form to the same URL as the path form", () => {
+    expect(toUrl_("switchbot-command -d X -c turnOff")).toBe(
+      "http://home-api.example/switchbot-command/-d/X/-c/turnOff"
+    );
+    expect(toUrl_("hue lights off")).toBe("http://home-api.example/hue/lights/off");
+  });
+  it("does not mistake speech text for a space-form command", () => {
+    expect(toUrl_("おはよう ございます")).toBeNull();
+    expect(toUrl_("test")).toBeNull();
+  });
 });
 
 describe("myFunction", () => {
