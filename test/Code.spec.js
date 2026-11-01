@@ -5,6 +5,7 @@ import {
   collectRequestCommands_,
   defaultSpeechCommand_,
   doGet,
+  doPost,
   myFunction,
   parseTarget_,
   toUrl_,
@@ -45,8 +46,15 @@ global.ContentService = {
 global.LockService = {
   getScriptLock: vi.fn(() => ({ waitLock: vi.fn(), releaseLock: vi.fn() })),
 };
+let tokenInfo;
 global.UrlFetchApp = {
   fetch: vi.fn((url) => {
+    if (String(url).startsWith("https://oauth2.googleapis.com/tokeninfo")) {
+      return {
+        getResponseCode: () => tokenInfo.code,
+        getContentText: () => JSON.stringify(tokenInfo.payload),
+      };
+    }
     fetched.push(url);
     return { getResponseCode: () => 200, getContentText: () => "OK" };
   }),
@@ -59,6 +67,8 @@ global.PropertiesService = {
         ({
           API_BASE_URL: "http://home-api.example",
           DEFAULT_SPEECH_PATH: "/speak/-h/192.0.2.1/-v/60/-s/",
+          AVAILABLE_GMAILS: "owner@example.com",
+          GOOGLE_OAUTH_CLIENT_ID: "dummy-client-id",
         })[name] || null
     ),
   })),
@@ -73,6 +83,16 @@ beforeEach(() => {
   fetched = [];
   outputContent = null;
   outputMime = null;
+  tokenInfo = {
+    code: 200,
+    payload: {
+      iss: "https://accounts.google.com",
+      aud: "dummy-client-id",
+      exp: String(Math.floor(Date.now() / 1000) + 3600),
+      email_verified: "true",
+      email: "owner@example.com",
+    },
+  };
   vi.clearAllMocks();
 });
 
@@ -241,5 +261,89 @@ describe("myFunction", () => {
     myFunction();
     expect(fetched).toEqual(["http://home-api.example/c"]);
     expect(deletedRows).toEqual([3, 1]);
+  });
+});
+
+describe("doPost", () => {
+  const post = (body) => doPost({ postData: { contents: JSON.stringify(body) } });
+  const auth = { idToken: "dummy-token" };
+
+  it("rejects a request without a valid token", () => {
+    post({ action: "list" });
+    expect(resultJson().ok).toBe(false);
+    expect(resultJson().status).toBe(401);
+  });
+
+  it("rejects an email that is not allowed", () => {
+    tokenInfo.payload.email = "someone-else@example.com";
+    post({ ...auth, action: "list" });
+    expect(resultJson().ok).toBe(false);
+    expect(resultJson().status).toBe(403);
+  });
+
+  it("rejects an expired token", () => {
+    tokenInfo.payload.exp = String(Math.floor(Date.now() / 1000) - 60);
+    post({ ...auth, action: "list" });
+    expect(resultJson().ok).toBe(false);
+  });
+
+  it("lists the registered alarms, oldest first", () => {
+    sheetValues = [
+      [new Date(2999, 0, 1, 7, 30, 0), "/hue/lights/off"],
+      [new Date(2999, 0, 1, 4, 50, 0), "/speak/x"],
+      ["", ""],
+    ];
+    post({ ...auth, action: "list" });
+    expect(resultJson()).toEqual({
+      ok: true,
+      alarms: [
+        { time: "29990101-04:50", commands: ["/speak/x"] },
+        { time: "29990101-07:30", commands: ["/hue/lights/off"] },
+      ],
+    });
+  });
+
+  it("registers an alarm with explicit commands", () => {
+    post({ ...auth, action: "set", time: "29990101-04:50", commands: ["/a", " /b "] });
+    expect(resultJson()).toEqual({ ok: true, time: "29990101-04:50", commands: 2 });
+    expect(appended).toHaveLength(1);
+    expect(appended[0].slice(1)).toEqual(["/a", "/b"]);
+  });
+
+  it("registers a speech alarm from text, or a time-only one without", () => {
+    post({ ...auth, action: "set", time: "29990101-04:50", text: "おはよう" });
+    expect(resultJson().ok).toBe(true);
+    expect(decodeURIComponent(appended[0][1].split("/-s/")[1])).toBe("4時50分です。おはよう");
+    post({ ...auth, action: "set", time: "29990101-05:00" });
+    expect(resultJson().ok).toBe(true);
+    expect(decodeURIComponent(appended[1][1].split("/-s/")[1])).toBe("5時ちょうどです。");
+  });
+
+  it("rejects a past time, too many commands, and unknown actions", () => {
+    post({ ...auth, action: "set", time: "20200101-04:50", commands: ["/a"] });
+    expect(resultJson().ok).toBe(false);
+    const cmds = Array.from({ length: 11 }, (_, i) => `/c${i}`);
+    post({ ...auth, action: "set", time: "29990101-04:50", commands: cmds });
+    expect(resultJson().ok).toBe(false);
+    post({ ...auth, action: "bogus" });
+    expect(resultJson().ok).toBe(false);
+    expect(appended).toHaveLength(0);
+  });
+
+  it("deletes the alarm for the given minute", () => {
+    sheetValues = [
+      [new Date(2999, 0, 1, 4, 50, 0), "/a"],
+      [new Date(2999, 0, 1, 7, 30, 0), "/b"],
+    ];
+    post({ ...auth, action: "delete", time: "29990101-07:30" });
+    expect(resultJson()).toEqual({ ok: true, deleted: 1 });
+    expect(deletedRows).toEqual([2]);
+    post({ ...auth, action: "delete", time: "29990101-09:00" });
+    expect(resultJson()).toEqual({ ok: true, deleted: 0 });
+  });
+
+  it("rejects invalid JSON", () => {
+    doPost({ postData: { contents: "not json" } });
+    expect(resultJson().ok).toBe(false);
   });
 });

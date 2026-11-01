@@ -71,3 +71,11 @@ UrlFetchApp, ContentService, LockService) and check the time
 parsing, the API rules (past time, overwrite, the 10 command
 limit, the legacy text fallback, JSONP), and the trigger logic
 (fire, clean up, keep, legacy rows, delete order).
+
+## Admin API for the alarm frontend
+
+`doPost` accepts a JSON body with a Google ID token (`idToken`).
+The token is verified and its email must be listed in the
+`AVAILABLE_GMAILS` script property (`GOOGLE_OAUTH_CLIENT_ID` is the
+expected audience). Actions: `list`, `set`, `delete`. The anonymous
+`doGet` above stays as it is for the existing home page.
