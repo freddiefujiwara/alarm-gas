@@ -104,9 +104,13 @@ export const sameMinute_ = (a, b) =>
   a.getHours() === b.getHours() &&
   a.getMinutes() === b.getMinutes();
 
+// What a text-less alarm says after the time: a nudge to get moving.
+export const EMPTY_TEXT_SUFFIX_ = '時間ですよ。時間ですよ。そろそろ時間ですよ。';
+
 // The speech text the old version built: "7時30分です。<text>".
+// With no text, the suffix above follows the time instead.
 export const buildSpeechText_ = (target, text) =>
-  `${target.getHours() % 12 || 12}時${target.getMinutes() ? target.getMinutes() + '分' : 'ちょうど'}です。${text}`;
+  `${target.getHours() % 12 || 12}時${target.getMinutes() ? target.getMinutes() + '分' : 'ちょうど'}です。${text ? text : EMPTY_TEXT_SUFFIX_}`;
 
 // A speech command (path on the home command API) for legacy text.
 export const defaultSpeechCommand_ = (target, text) =>
@@ -114,7 +118,7 @@ export const defaultSpeechCommand_ = (target, text) =>
 
 // Commands from the request. When no cmd is given, this falls back
 // to one default speech command: with the legacy "text" when present,
-// or a time-only announcement when it is not (the old behavior).
+// or the time announcement (with its nudge suffix) when it is not.
 export const collectRequestCommands_ = (e, target) => {
   const params = (e && e.parameters) || {};
   let cmds = [];
