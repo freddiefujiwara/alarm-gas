@@ -53,7 +53,7 @@
 // Recurring rules live in a separate sheet named "rules" (created on
 // demand, with a header row): id, time of day ("HH:MM"), weekdays
 // (comma-separated active days, 0 = Sunday; empty means every day),
-// until ("YYYYMMDD", empty means no end), last_fired ("YYYYMMDD"),
+// until ("YYYYMMDD", empty means no end), last_fired ("YYYYMMDDHHMM"),
 // then up to 10 commands. The every-minute trigger fires a rule when
 // today is an active day within the fire window, marks last_fired so
 // it cannot fire twice, and deletes rules whose until date has passed.
@@ -661,6 +661,9 @@ export const formatTimeOfDay_ = (hour, minute) => `${pad2_(hour)}:${pad2_(minute
 export const formatDateKey_ = (d) =>
   `${d.getFullYear()}${pad2_(d.getMonth() + 1)}${pad2_(d.getDate())}`;
 
+export const formatDateTimeKey_ = (d) =>
+  `${formatDateKey_(d)}${pad2_(d.getHours())}${pad2_(d.getMinutes())}`;
+
 // Weekdays input (array of day numbers, or a comma-separated string)
 // -> a sorted unique array, or null when a value is not a day number.
 // An empty input means every day.
@@ -699,6 +702,25 @@ export const parseDateKey_ = (value) => {
   return digits;
 };
 
+// A stored last_fired cell -> "YYYYMMDDHHMM" (or the legacy
+// date-only "YYYYMMDD" written by older versions). Anything
+// unparseable reads as never fired ("").
+export const parseLastFired_ = (value) => {
+  if (value == null || value === '') return '';
+  if (value instanceof Date) {
+    return isNaN(value.getTime()) ? '' : formatDateTimeKey_(value);
+  }
+  const digits = String(value).replace(/\D/g, '');
+  if (!/^\d{8}(\d{4})?$/.test(digits)) return '';
+  if (parseDateKey_(digits.slice(0, 8)) === null) return '';
+  if (digits.length === 12) {
+    const hour = +digits.slice(8, 10);
+    const minute = +digits.slice(10, 12);
+    if (hour > 23 || minute > 59) return '';
+  }
+  return digits;
+};
+
 // A rule row's time cell: a "HH:MM" string, or a Date (Sheets turns
 // "7:30" into a time value on a 1899 date; only the clock matters).
 export const parseRuleTimeCell_ = (value) => {
@@ -720,7 +742,7 @@ export const rowToRule_ = (row) => {
   if (!weekdays) return null;
   const until = parseDateKey_(row[3]);
   if (until === null) return null;
-  const lastFired = parseDateKey_(row[4]) || '';
+  const lastFired = parseLastFired_(row[4]);
   const commands = row
     .slice(5)
     .map((c) => String(c == null ? '' : c).trim())
@@ -733,8 +755,9 @@ export const serializeRule_ = (rule) => ({
   time: formatTimeOfDay_(rule.hour, rule.minute),
   weekdays: rule.weekdays,
   until: rule.until || null,
-  // Exposed so callers can confirm a rule actually fired on a day
-  // ("YYYYMMDD", null when it never fired).
+  // Exposed so callers can confirm when a rule actually fired
+  // ("YYYYMMDDHHMM"; rows last fired by older versions hold the
+  // date-only "YYYYMMDD". Null when it never fired.)
   last_fired: rule.lastFired || null,
   commands: rule.commands,
 });
@@ -818,11 +841,11 @@ export const processRules_ = (now) => {
       return;
     }
     if (!rule.weekdays.includes(now.getDay())) return;
-    if (rule.lastFired === todayKey) return;
+    if (rule.lastFired.startsWith(todayKey)) return;
     const target = new Date(now.getFullYear(), now.getMonth(), now.getDate(), rule.hour, rule.minute, 0);
     if (classify_(target, now) !== 'fire') return;
     fireCells_(target, rule.commands);
-    sheet.getRange(i + 1, 5).setValue(todayKey);
+    sheet.getRange(i + 1, 5).setValue(formatDateTimeKey_(now));
   });
 
   deleteRows

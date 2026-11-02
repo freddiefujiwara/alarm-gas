@@ -733,9 +733,16 @@ describe("processRules_", () => {
     rulesValues.push(["r1", "07:30", "0,1,2,3,4,5,6", "", "", "/hue/lights/off"]);
     processRules_(monday);
     expect(fetched).toEqual(["http://home-api.example/hue/lights/off"]);
-    expect(rulesValues[1][4]).toBe("20261102");
+    expect(rulesValues[1][4]).toBe("202611020730");
     processRules_(new Date(2026, 10, 2, 7, 30, 40));
     expect(fetched).toHaveLength(1);
+  });
+
+  it("does not refire a rule whose last_fired is today, in either format", () => {
+    rulesValues.push(["r1", "07:30", "0,1,2,3,4,5,6", "", "202611020700", "/a"]);
+    rulesValues.push(["r2", "07:30", "0,1,2,3,4,5,6", "", "20261102", "/b"]);
+    processRules_(monday);
+    expect(fetched).toHaveLength(0);
   });
 
   it("does not fire on an inactive weekday or outside the window", () => {
