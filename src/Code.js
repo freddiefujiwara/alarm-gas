@@ -733,6 +733,9 @@ export const serializeRule_ = (rule) => ({
   time: formatTimeOfDay_(rule.hour, rule.minute),
   weekdays: rule.weekdays,
   until: rule.until || null,
+  // Exposed so callers can confirm a rule actually fired on a day
+  // ("YYYYMMDD", null when it never fired).
+  last_fired: rule.lastFired || null,
   commands: rule.commands,
 });
 

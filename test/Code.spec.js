@@ -636,6 +636,7 @@ describe("doPost rules", () => {
     expect(created.rule.time).toBe("07:30");
     expect(created.rule.weekdays).toEqual([1, 2, 3, 4, 5]);
     expect(created.rule.until).toBeNull();
+    expect(created.rule.last_fired).toBeNull();
     expect(rulesValues).toHaveLength(2);
 
     post({ ...auth, action: "list_rules" });
@@ -646,6 +647,14 @@ describe("doPost rules", () => {
     expect(rulesValues).toHaveLength(1);
     post({ ...auth, action: "delete_rule", id: created.rule.id });
     expect(resultJson()).toEqual({ ok: true, deleted: 0 });
+  });
+
+  it("reports last_fired for a rule that already fired", () => {
+    rulesValues.push(["r9", "19:30", "0,1,2,3,4,5,6", "", "20261102", "/a"]);
+    post({ ...auth, action: "list_rules" });
+    const rules = resultJson().rules;
+    expect(rules).toHaveLength(1);
+    expect(rules[0].last_fired).toBe("20261102");
   });
 
   it("turns exclude_weekdays into the active set", () => {
