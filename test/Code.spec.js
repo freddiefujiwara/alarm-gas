@@ -138,6 +138,7 @@ global.PropertiesService = {
           DEFAULT_SPEECH_PATH: "/speak/-h/192.0.2.1/-v/60/-s/",
           AVAILABLE_GMAILS: "owner@example.com",
           GOOGLE_OAUTH_CLIENT_ID: "dummy-client-id",
+          SYNC_TOKEN: "test-sync-token",
         })[name] || null
     ),
   })),
@@ -670,12 +671,49 @@ describe("doPost rules", () => {
   });
 
   it("enforces the rule limit", () => {
-    for (let i = 0; i < 256; i += 1) {
+    for (let i = 0; i < 20; i += 1) {
       rulesValues.push([`id-${i}`, "07:00", "0,1,2,3,4,5,6", "", "", "/a"]);
     }
     post({ ...auth, action: "set_rule", time: "07:00", commands: ["/a"] });
     expect(resultJson().ok).toBe(false);
     expect(resultJson().error).toContain("too many rules");
+  });
+});
+
+describe("doPost sync token", () => {
+  const post = (body) => doPost({ postData: { contents: JSON.stringify(body) } });
+  const sync = { sync_token: "test-sync-token" };
+
+  it("manages rules with the sync token and marks the response", () => {
+    post({ ...sync, action: "set_rule", time: "06:45", commands: ["/a"] });
+    const created = resultJson();
+    expect(created.ok).toBe(true);
+    expect(created._sync).toBe(true);
+
+    post({ ...sync, action: "list_rules" });
+    expect(resultJson().rules).toHaveLength(1);
+
+    post({ ...sync, action: "delete_rule", id: created.rule.id });
+    expect(resultJson().ok).toBe(true);
+    post({ ...sync, action: "list_rules" });
+    expect(resultJson().rules).toHaveLength(0);
+  });
+
+  it("rejects a wrong sync token", () => {
+    post({ sync_token: "wrong", action: "list_rules" });
+    expect(resultJson().ok).toBe(false);
+    expect(resultJson().status).toBe(401);
+  });
+
+  it("cannot touch one-shot alarms or share sessions", () => {
+    post({ ...sync, action: "list" });
+    expect(resultJson().ok).toBe(false);
+    expect(resultJson().status).toBe(403);
+    post({ ...sync, action: "set", time: "29990101-07:00", commands: ["/a"] });
+    expect(resultJson().ok).toBe(false);
+    expect(resultJson().status).toBe(403);
+    post({ ...sync, action: "issue_share" });
+    expect(resultJson().ok).toBe(false);
   });
 });
 
