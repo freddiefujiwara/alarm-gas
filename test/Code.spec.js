@@ -670,7 +670,7 @@ describe("doPost rules", () => {
   });
 
   it("enforces the rule limit", () => {
-    for (let i = 0; i < 20; i += 1) {
+    for (let i = 0; i < 256; i += 1) {
       rulesValues.push([`id-${i}`, "07:00", "0,1,2,3,4,5,6", "", "", "/a"]);
     }
     post({ ...auth, action: "set_rule", time: "07:00", commands: ["/a"] });
