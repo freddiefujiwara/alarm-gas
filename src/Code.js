@@ -630,7 +630,7 @@ export const fireCells_ = (target, cells) => {
 // one-shot sheet keeps its self-cleaning shape.
 
 const RULES_SHEET_NAME = 'rules';
-const MAX_RULES = 20;
+const MAX_RULES = 256;
 const ALL_WEEKDAYS_ = [0, 1, 2, 3, 4, 5, 6];
 const RULES_HEADERS = ['id', 'time', 'weekdays', 'until', 'last_fired', 'commands'];
 
