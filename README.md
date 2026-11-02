@@ -51,6 +51,12 @@ Example:
    - `API_BASE_URL`: base URL of the home command API.
    - `DEFAULT_SPEECH_PATH`: path prefix of the speech command used
      for old style text alarms, ending with `/-s/`.
+   - `SYNC_TOKEN` (optional): a long-lived token for a trusted
+     machine client (the time-table sync) to manage recurring rules
+     via the `list_rules` / `set_rule` / `delete_rule` actions. Send
+     it as `sync_token` in the JSON body. It cannot touch one-shot
+     alarms or share sessions and does not expire; set the same value
+     in the client script's properties.
 3. Set `.clasp.json` to that project's script ID.
 4. Run `npm install`, `npm run build`, and `npm run deploy`
    (clasp push) to send `dist/` to the project.

@@ -408,6 +408,25 @@ export const validateShareToken_ = (token) => {
   return null;
 };
 
+// --- Machine sync token ---
+// A single long-lived token for machine-to-machine rule sync: the
+// time-table script mirrors its sheet into recurring rules here, so
+// firing lives in one place while the sheet stays private to that
+// script (this project never reads it). The token lives only in the
+// SYNC_TOKEN script property, never in code, and is scoped to the
+// rule actions below — it cannot touch one-shot alarms or share
+// sessions, and it does not expire like a share session.
+
+const SYNC_ACTIONS_ = ['list_rules', 'set_rule', 'delete_rule'];
+
+export const validateSyncToken_ = (token) => {
+  if (!token) {
+    return false;
+  }
+  const expected = getProperty_('SYNC_TOKEN');
+  return !!expected && String(token) === expected;
+};
+
 // Commands for a doPost "set" body: an explicit commands array wins;
 // otherwise fall back to one speech command (text may be empty).
 export const collectBodyCommands_ = (body, target) => {
@@ -454,10 +473,20 @@ export const doPost = (e) => {
     return jsonOut_({ ok: true, ...result });
   }
 
-  // The remaining actions accept either the owner's ID token or a
-  // share token from an issued access link (owner-equivalent).
+  // The remaining actions accept the owner's ID token, a share token
+  // from an issued access link (owner-equivalent), or — for the rule
+  // actions only — the machine sync token.
   let shareSession = null;
-  if (body.share_token) {
+  let syncAuth = false;
+  if (body.sync_token) {
+    if (!validateSyncToken_(body.sync_token)) {
+      return jsonOut_({ ok: false, status: 401, error: 'sync token invalid' });
+    }
+    if (!SYNC_ACTIONS_.includes(body.action)) {
+      return jsonOut_({ ok: false, status: 403, error: 'sync token may only manage rules' });
+    }
+    syncAuth = true;
+  } else if (body.share_token) {
     shareSession = validateShareToken_(body.share_token);
     if (!shareSession) {
       return jsonOut_({ ok: false, status: 401, error: 'share session expired or invalid' });
@@ -470,7 +499,11 @@ export const doPost = (e) => {
     }
   }
   const out = (payload) =>
-    shareSession ? { ...payload, _share: { expires_at: shareSession.expires_at } } : payload;
+    shareSession
+      ? { ...payload, _share: { expires_at: shareSession.expires_at } }
+      : syncAuth
+        ? { ...payload, _sync: true }
+        : payload;
 
   if (body.action === 'list') {
     return jsonOut_(
@@ -597,7 +630,7 @@ export const fireCells_ = (target, cells) => {
 // one-shot sheet keeps its self-cleaning shape.
 
 const RULES_SHEET_NAME = 'rules';
-const MAX_RULES = 256;
+const MAX_RULES = 20;
 const ALL_WEEKDAYS_ = [0, 1, 2, 3, 4, 5, 6];
 const RULES_HEADERS = ['id', 'time', 'weekdays', 'until', 'last_fired', 'commands'];
 
