@@ -7,7 +7,11 @@ import {
   doGet,
   doPost,
   myFunction,
+  parseDateKey_,
   parseTarget_,
+  parseTimeOfDay_,
+  parseWeekdays_,
+  processRules_,
   toUrl_,
 } from "../src/Code.js";
 
@@ -52,11 +56,31 @@ const mockShareSheet = {
   })),
 };
 
+let rulesValues;
+let rulesSheetExists;
+
+const mockRulesSheet = {
+  getDataRange: vi.fn(() => ({ getValues: vi.fn(() => rulesValues) })),
+  appendRow: vi.fn((row) => rulesValues.push([...row])),
+  deleteRow: vi.fn((n) => rulesValues.splice(n - 1, 1)),
+  getRange: vi.fn((row, col) => ({
+    setValue: vi.fn((value) => {
+      rulesValues[row - 1][col - 1] = value;
+    }),
+  })),
+};
+
 const mockSpreadsheet = {
-  getSheetByName: vi.fn((name) =>
-    name === "share_sessions" ? (shareSheetExists ? mockShareSheet : null) : null
-  ),
-  insertSheet: vi.fn(() => {
+  getSheetByName: vi.fn((name) => {
+    if (name === "share_sessions") return shareSheetExists ? mockShareSheet : null;
+    if (name === "rules") return rulesSheetExists ? mockRulesSheet : null;
+    return null;
+  }),
+  insertSheet: vi.fn((name) => {
+    if (name === "rules") {
+      rulesSheetExists = true;
+      return mockRulesSheet;
+    }
     shareSheetExists = true;
     shareInserted += 1;
     return mockShareSheet;
@@ -134,6 +158,8 @@ beforeEach(() => {
   shareValues = [
     ["token_hash", "issued_at", "expires_at", "revoked_at", "access_count", "last_accessed_at"],
   ];
+  rulesSheetExists = true;
+  rulesValues = [["id", "time", "weekdays", "until", "last_fired", "commands"]];
   tokenInfo = {
     code: 200,
     payload: {
@@ -565,5 +591,124 @@ describe("doPost share sessions", () => {
     expect(resultJson().ok).toBe(false);
     expect(resultJson().status).toBe(401);
     expect(shareValues).toHaveLength(2);
+  });
+});
+
+describe("rule parsing helpers", () => {
+  it("parses a time of day", () => {
+    expect(parseTimeOfDay_("7:30")).toEqual({ hour: 7, minute: 30 });
+    expect(parseTimeOfDay_("07:05:00")).toEqual({ hour: 7, minute: 5 });
+    expect(parseTimeOfDay_("24:00")).toBeNull();
+    expect(parseTimeOfDay_("7:60")).toBeNull();
+    expect(parseTimeOfDay_("abc")).toBeNull();
+    expect(parseTimeOfDay_("20261102-07:30")).toBeNull();
+  });
+
+  it("parses weekdays, defaulting to every day", () => {
+    expect(parseWeekdays_(undefined)).toEqual([0, 1, 2, 3, 4, 5, 6]);
+    expect(parseWeekdays_("")).toEqual([0, 1, 2, 3, 4, 5, 6]);
+    expect(parseWeekdays_([5, 1, 1])).toEqual([1, 5]);
+    expect(parseWeekdays_("6,0")).toEqual([0, 6]);
+    expect(parseWeekdays_([7])).toBeNull();
+    expect(parseWeekdays_(["x"])).toBeNull();
+  });
+
+  it("parses until dates in several shapes", () => {
+    expect(parseDateKey_(undefined)).toBe("");
+    expect(parseDateKey_("20261231")).toBe("20261231");
+    expect(parseDateKey_("2026-12-31")).toBe("20261231");
+    expect(parseDateKey_(20261231)).toBe("20261231");
+    expect(parseDateKey_(new Date(2026, 11, 31))).toBe("20261231");
+    expect(parseDateKey_("20260230")).toBeNull();
+    expect(parseDateKey_("tomorrow")).toBeNull();
+  });
+});
+
+describe("doPost rules", () => {
+  const post = (body) => doPost({ postData: { contents: JSON.stringify(body) } });
+  const auth = { idToken: "dummy-token" };
+
+  it("adds, lists, and deletes a rule", () => {
+    post({ ...auth, action: "set_rule", time: "07:30", weekdays: [1, 2, 3, 4, 5], commands: ["/a"] });
+    const created = resultJson();
+    expect(created.ok).toBe(true);
+    expect(created.rule.time).toBe("07:30");
+    expect(created.rule.weekdays).toEqual([1, 2, 3, 4, 5]);
+    expect(created.rule.until).toBeNull();
+    expect(rulesValues).toHaveLength(2);
+
+    post({ ...auth, action: "list_rules" });
+    expect(resultJson().rules).toEqual([created.rule]);
+
+    post({ ...auth, action: "delete_rule", id: created.rule.id });
+    expect(resultJson()).toEqual({ ok: true, deleted: 1 });
+    expect(rulesValues).toHaveLength(1);
+    post({ ...auth, action: "delete_rule", id: created.rule.id });
+    expect(resultJson()).toEqual({ ok: true, deleted: 0 });
+  });
+
+  it("turns exclude_weekdays into the active set", () => {
+    post({ ...auth, action: "set_rule", time: "06:00", exclude_weekdays: [0, 6], text: "おはよう" });
+    expect(resultJson().rule.weekdays).toEqual([1, 2, 3, 4, 5]);
+    post({ ...auth, action: "set_rule", time: "06:00", exclude_weekdays: [0, 1, 2, 3, 4, 5, 6] });
+    expect(resultJson().ok).toBe(false);
+  });
+
+  it("rejects an invalid time, weekdays, and a past until", () => {
+    post({ ...auth, action: "set_rule", time: "25:00", commands: ["/a"] });
+    expect(resultJson().ok).toBe(false);
+    post({ ...auth, action: "set_rule", time: "07:00", weekdays: [9], commands: ["/a"] });
+    expect(resultJson().ok).toBe(false);
+    post({ ...auth, action: "set_rule", time: "07:00", until: "20200101", commands: ["/a"] });
+    expect(resultJson().ok).toBe(false);
+    expect(rulesValues).toHaveLength(1);
+  });
+
+  it("accepts an until date and reports it", () => {
+    post({ ...auth, action: "set_rule", time: "07:00", until: "29991231", commands: ["/a"] });
+    expect(resultJson().rule.until).toBe("29991231");
+  });
+
+  it("enforces the rule limit", () => {
+    for (let i = 0; i < 20; i += 1) {
+      rulesValues.push([`id-${i}`, "07:00", "0,1,2,3,4,5,6", "", "", "/a"]);
+    }
+    post({ ...auth, action: "set_rule", time: "07:00", commands: ["/a"] });
+    expect(resultJson().ok).toBe(false);
+    expect(resultJson().error).toContain("too many rules");
+  });
+});
+
+describe("processRules_", () => {
+  const monday = new Date(2026, 10, 2, 7, 30, 10); // 2026-11-02 is a Monday
+
+  it("fires a due rule once and marks last_fired", () => {
+    rulesValues.push(["r1", "07:30", "0,1,2,3,4,5,6", "", "", "/hue/lights/off"]);
+    processRules_(monday);
+    expect(fetched).toEqual(["http://home-api.example/hue/lights/off"]);
+    expect(rulesValues[1][4]).toBe("20261102");
+    processRules_(new Date(2026, 10, 2, 7, 30, 40));
+    expect(fetched).toHaveLength(1);
+  });
+
+  it("does not fire on an inactive weekday or outside the window", () => {
+    rulesValues.push(["r1", "07:30", "2,3,4,5,6", "", "", "/a"]); // Mondays off
+    processRules_(monday);
+    expect(fetched).toHaveLength(0);
+    rulesValues[1][2] = "0,1,2,3,4,5,6";
+    processRules_(new Date(2026, 10, 2, 9, 0, 0));
+    expect(fetched).toHaveLength(0);
+  });
+
+  it("deletes rules past their until date", () => {
+    rulesValues.push(["r1", "07:30", "0,1,2,3,4,5,6", "20261101", "", "/a"]);
+    processRules_(monday);
+    expect(rulesValues).toHaveLength(1);
+    expect(fetched).toHaveLength(0);
+  });
+
+  it("does nothing when the rules sheet does not exist", () => {
+    rulesSheetExists = false;
+    expect(() => processRules_(monday)).not.toThrow();
   });
 });

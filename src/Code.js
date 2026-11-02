@@ -38,12 +38,25 @@
 //   { action: "set", time, commands } or { ..., text }
 //                        -> register (or overwrite) an alarm.
 //   { action: "delete", time } -> remove the alarm for that minute.
+//   { action: "list_rules" }   -> the recurring rules.
+//   { action: "set_rule", time, weekdays | exclude_weekdays,
+//     until?, commands | text }
+//                        -> add a recurring rule (at most MAX_RULES).
+//   { action: "delete_rule", id } -> remove one recurring rule.
 //   { action: "issue_share" }  -> issue a temporary access link.
 //   { action: "revoke_share" } -> revoke the active access links.
 //   As an alternative to "idToken", the list/set/delete actions also
 //   accept a "share_token" from an issued access link. A share token
 //   has the same rights as the owner (it can register and delete
 //   alarms); share-authenticated responses carry "_share.expires_at".
+//
+// Recurring rules live in a separate sheet named "rules" (created on
+// demand, with a header row): id, time of day ("HH:MM"), weekdays
+// (comma-separated active days, 0 = Sunday; empty means every day),
+// until ("YYYYMMDD", empty means no end), last_fired ("YYYYMMDD"),
+// then up to 10 commands. The every-minute trigger fires a rule when
+// today is an active day within the fire window, marks last_fired so
+// it cannot fire twice, and deletes rules whose until date has passed.
 //
 // A request for a datetime that already exists overwrites that row.
 // A request for a past datetime is rejected with an error.
@@ -488,7 +501,297 @@ export const doPost = (e) => {
     return jsonOut_(out({ ok: true, time: formatTarget_(target), commands: commands.length }));
   }
 
+  if (body.action === 'list_rules') {
+    return jsonOut_(out({ ok: true, rules: readRules_().map(serializeRule_) }));
+  }
+
+  if (body.action === 'delete_rule') {
+    const id = body.id ? String(body.id).trim() : '';
+    if (!id) {
+      return jsonOut_({ ok: false, error: 'missing rule id' });
+    }
+    return jsonOut_(out({ ok: true, deleted: deleteRule_(id) ? 1 : 0 }));
+  }
+
+  if (body.action === 'set_rule') {
+    const time = parseTimeOfDay_(body.time || '');
+    if (!time) {
+      return jsonOut_({ ok: false, error: 'invalid time format: use HH:MM' });
+    }
+    let weekdays;
+    if (body.exclude_weekdays != null) {
+      const excluded = parseWeekdays_(body.exclude_weekdays);
+      if (!excluded) {
+        return jsonOut_({ ok: false, error: 'invalid exclude_weekdays: use day numbers 0-6' });
+      }
+      weekdays = ALL_WEEKDAYS_.filter((d) => !excluded.includes(d));
+      if (weekdays.length === 0) {
+        return jsonOut_({ ok: false, error: 'no active weekdays left' });
+      }
+    } else {
+      weekdays = parseWeekdays_(body.weekdays);
+      if (!weekdays) {
+        return jsonOut_({ ok: false, error: 'invalid weekdays: use day numbers 0-6' });
+      }
+    }
+    const until = parseDateKey_(body.until);
+    if (until === null) {
+      return jsonOut_({ ok: false, error: 'invalid until date: use YYYYMMDD' });
+    }
+    if (until && until < formatDateKey_(new Date())) {
+      return jsonOut_({ ok: false, error: 'until date is in the past' });
+    }
+    const target = new Date();
+    target.setHours(time.hour, time.minute, 0, 0);
+    const commands = collectBodyCommands_(body, target);
+    if (commands.length > MAX_COMMANDS) {
+      return jsonOut_({ ok: false, error: `too many commands: max is ${MAX_COMMANDS}` });
+    }
+    const rule = {
+      id: Utilities.getUuid(),
+      hour: time.hour,
+      minute: time.minute,
+      weekdays,
+      until,
+      lastFired: '',
+      commands,
+    };
+    try {
+      addRule_(rule);
+    } catch (err) {
+      return jsonOut_({ ok: false, error: err.message });
+    }
+    return jsonOut_(out({ ok: true, rule: serializeRule_(rule) }));
+  }
+
   return jsonOut_({ ok: false, error: 'unknown action' });
+};
+
+// Fire one row's command cells: convert each cell to a URL, gather
+// any legacy speech texts into one default speech command in front,
+// and call the home command API once per command.
+export const fireCells_ = (target, cells) => {
+  const urls = [];
+  const legacyTexts = [];
+  cells.forEach((c) => {
+    const url = toUrl_(c);
+    if (url) urls.push(url);
+    else legacyTexts.push(c);
+  });
+  if (legacyTexts.length > 0) {
+    // Old-format row ([time, text]): speak it like the old version.
+    urls.unshift(apiBaseUrl_() + defaultSpeechCommand_(target, legacyTexts.join(' ')));
+  }
+  urls.slice(0, MAX_COMMANDS).forEach((url) => {
+    const res = UrlFetchApp.fetch(url, {
+      muteHttpExceptions: true,
+      method: 'get',
+    });
+    Logger.log(url + ' -> ' + res.getResponseCode());
+  });
+};
+
+// --- Recurring rules ---
+// A rule fires at a fixed time of day on its active weekdays, with an
+// optional end date. Rules are stored in their own sheet so the
+// one-shot sheet keeps its self-cleaning shape.
+
+const RULES_SHEET_NAME = 'rules';
+const MAX_RULES = 20;
+const ALL_WEEKDAYS_ = [0, 1, 2, 3, 4, 5, 6];
+const RULES_HEADERS = ['id', 'time', 'weekdays', 'until', 'last_fired', 'commands'];
+
+export const getRulesSheet_ = () => {
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = spreadsheet.getSheetByName(RULES_SHEET_NAME);
+  if (!sheet) {
+    sheet = spreadsheet.insertSheet(RULES_SHEET_NAME);
+    sheet.appendRow(RULES_HEADERS);
+  }
+  return sheet;
+};
+
+// "HH:MM" (seconds optional) -> { hour, minute } or null.
+export const parseTimeOfDay_ = (value) => {
+  if (typeof value !== 'string') return null;
+  const m = value.trim().match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+  if (!m) return null;
+  const hour = +m[1];
+  const minute = +m[2];
+  const second = +(m[3] || 0);
+  if (hour > 23 || minute > 59 || second > 59) return null;
+  return { hour, minute };
+};
+
+export const formatTimeOfDay_ = (hour, minute) => `${pad2_(hour)}:${pad2_(minute)}`;
+
+export const formatDateKey_ = (d) =>
+  `${d.getFullYear()}${pad2_(d.getMonth() + 1)}${pad2_(d.getDate())}`;
+
+// Weekdays input (array of day numbers, or a comma-separated string)
+// -> a sorted unique array, or null when a value is not a day number.
+// An empty input means every day.
+export const parseWeekdays_ = (value) => {
+  if (value == null || value === '') return ALL_WEEKDAYS_.slice();
+  const items = Array.isArray(value) ? value : String(value).split(',');
+  const days = [];
+  for (const item of items) {
+    if (typeof item === 'string' && item.trim() === '') continue;
+    const n = Number(item);
+    if (!Number.isInteger(n) || n < 0 || n > 6) return null;
+    if (!days.includes(n)) days.push(n);
+  }
+  if (days.length === 0) return ALL_WEEKDAYS_.slice();
+  return days.sort((a, b) => a - b);
+};
+
+// An "until" cell or input -> "YYYYMMDD", or '' when empty. Returns
+// null for a value that is not a real date. Accepts "YYYYMMDD",
+// "YYYY-MM-DD", a Date, or an 8-digit number (Sheets may store the
+// bare digits as a number).
+export const parseDateKey_ = (value) => {
+  if (value == null || value === '') return '';
+  if (value instanceof Date) {
+    return isNaN(value.getTime()) ? null : formatDateKey_(value);
+  }
+  const digits = String(value).replace(/\D/g, '');
+  if (!/^\d{8}$/.test(digits)) return null;
+  const year = +digits.slice(0, 4);
+  const month = +digits.slice(4, 6);
+  const day = +digits.slice(6, 8);
+  const d = new Date(year, month - 1, day);
+  if (d.getFullYear() !== year || d.getMonth() !== month - 1 || d.getDate() !== day) {
+    return null;
+  }
+  return digits;
+};
+
+// A rule row's time cell: a "HH:MM" string, or a Date (Sheets turns
+// "7:30" into a time value on a 1899 date; only the clock matters).
+export const parseRuleTimeCell_ = (value) => {
+  if (value instanceof Date) {
+    if (isNaN(value.getTime())) return null;
+    return { hour: value.getHours(), minute: value.getMinutes() };
+  }
+  return parseTimeOfDay_(value == null ? '' : String(value));
+};
+
+// One rules-sheet row -> a rule object, or null when the row is not a
+// readable rule (blank rows are handled by the caller).
+export const rowToRule_ = (row) => {
+  const id = String(row[0] == null ? '' : row[0]).trim();
+  if (!id) return null;
+  const time = parseRuleTimeCell_(row[1]);
+  if (!time) return null;
+  const weekdays = parseWeekdays_(row[2] == null ? '' : String(row[2]));
+  if (!weekdays) return null;
+  const until = parseDateKey_(row[3]);
+  if (until === null) return null;
+  const lastFired = parseDateKey_(row[4]) || '';
+  const commands = row
+    .slice(5)
+    .map((c) => String(c == null ? '' : c).trim())
+    .filter((c) => c.length > 0);
+  return { id, hour: time.hour, minute: time.minute, weekdays, until, lastFired, commands };
+};
+
+export const serializeRule_ = (rule) => ({
+  id: rule.id,
+  time: formatTimeOfDay_(rule.hour, rule.minute),
+  weekdays: rule.weekdays,
+  until: rule.until || null,
+  commands: rule.commands,
+});
+
+// The stored rules, in sheet order. Malformed rows are skipped.
+export const readRules_ = () => {
+  const sheet = getRulesSheet_();
+  const values = sheet.getDataRange().getValues();
+  const rules = [];
+  values.forEach((row, i) => {
+    if (i === 0) return; // header
+    const rule = rowToRule_(row);
+    if (rule) rules.push(rule);
+  });
+  return rules;
+};
+
+// Append a rule. Throws when the rule limit has been reached.
+export const addRule_ = (rule) => {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    if (readRules_().length >= MAX_RULES) {
+      throw new Error(`too many rules: max is ${MAX_RULES}`);
+    }
+    getRulesSheet_().appendRow([
+      rule.id,
+      formatTimeOfDay_(rule.hour, rule.minute),
+      rule.weekdays.join(','),
+      rule.until || '',
+      '',
+      ...rule.commands,
+    ]);
+  } finally {
+    lock.releaseLock();
+  }
+};
+
+// Remove the rule with this id. Returns true when one was removed.
+export const deleteRule_ = (id) => {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    const sheet = getRulesSheet_();
+    const values = sheet.getDataRange().getValues();
+    for (let i = 1; i < values.length; i++) {
+      if (String(values[i][0] == null ? '' : values[i][0]).trim() === id) {
+        sheet.deleteRow(i + 1);
+        return true;
+      }
+    }
+    return false;
+  } finally {
+    lock.releaseLock();
+  }
+};
+
+// Fire the rules that are due today. Called from the every-minute
+// trigger: a rule fires when today is one of its weekdays, the clock
+// is inside the fire window, and it has not fired today yet
+// (last_fired guards against the two trigger runs inside the
+// window). Rules past their until date are deleted.
+export const processRules_ = (now) => {
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = spreadsheet.getSheetByName(RULES_SHEET_NAME);
+  if (!sheet) return;
+  const values = sheet.getDataRange().getValues();
+  const todayKey = formatDateKey_(now);
+  const deleteRows = [];
+
+  values.forEach((row, i) => {
+    if (i === 0) return; // header
+    const rule = rowToRule_(row);
+    if (!rule) {
+      const hasContent = row.some((c) => String(c == null ? '' : c).trim().length > 0);
+      if (hasContent) deleteRows.push(i + 1); // unreadable row: clean up
+      return;
+    }
+    if (rule.until && todayKey > rule.until) {
+      deleteRows.push(i + 1);
+      return;
+    }
+    if (!rule.weekdays.includes(now.getDay())) return;
+    if (rule.lastFired === todayKey) return;
+    const target = new Date(now.getFullYear(), now.getMonth(), now.getDate(), rule.hour, rule.minute, 0);
+    if (classify_(target, now) !== 'fire') return;
+    fireCells_(target, rule.commands);
+    sheet.getRange(i + 1, 5).setValue(todayKey);
+  });
+
+  deleteRows
+    .sort((a, b) => b - a)
+    .forEach((rowNumber) => sheet.deleteRow(rowNumber));
 };
 
 // A sheet cell -> Date (or null). Time-only values left by the old
@@ -573,24 +876,7 @@ export const myFunction = () => {
     if (kind === 'keep') return;
 
     if (kind === 'fire') {
-      const urls = [];
-      const legacyTexts = [];
-      cells.forEach((c) => {
-        const url = toUrl_(c);
-        if (url) urls.push(url);
-        else legacyTexts.push(c);
-      });
-      if (legacyTexts.length > 0) {
-        // Old-format row ([time, text]): speak it like the old version.
-        urls.unshift(apiBaseUrl_() + defaultSpeechCommand_(target, legacyTexts.join(' ')));
-      }
-      urls.slice(0, MAX_COMMANDS).forEach((url) => {
-        const res = UrlFetchApp.fetch(url, {
-          muteHttpExceptions: true,
-          method: 'get',
-        });
-        Logger.log(url + ' -> ' + res.getResponseCode());
-      });
+      fireCells_(target, cells);
     }
     deleteRows.push(i + 1);
   });
@@ -599,4 +885,6 @@ export const myFunction = () => {
   deleteRows
     .sort((a, b) => b - a)
     .forEach((rowNumber) => sheet.deleteRow(rowNumber));
+
+  processRules_(now);
 };
