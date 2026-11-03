@@ -13,6 +13,19 @@
 //   DEFAULT_SPEECH_PATH Path prefix of the speech command used for
 //                       legacy text alarms, ending with "/-s/".
 //
+// Optional properties separate a staging copy of this script from
+// production. All are unset in production, where nothing changes:
+//   SPREADSHEET_ID Opens that spreadsheet instead of the container
+//                  spreadsheet (for a standalone staging copy).
+//   SHEET_PREFIX   This environment's sheet prefix. With "stg", the
+//                  one-shot alarms live in a sheet named "stg" and
+//                  the rules / share sheets are "stg_rules" /
+//                  "stg_share_sessions" in the same spreadsheet.
+//                  Without it, one-shots use the active sheet and
+//                  the sheets are "rules" / "share_sessions".
+//   DRY_RUN        "1" or "true": log command URLs instead of
+//                  calling them, so no real device is touched.
+//
 // Sheet layout (the sheet is machine-managed; there is no header row):
 //   Column A:     datetime to fire (a Date value)
 //   Columns B..K: up to 10 commands. A command is a path on the home
@@ -76,6 +89,51 @@ const getProperty_ = (name) => {
 
 const apiBaseUrl_ = () => getProperty_('API_BASE_URL');
 const defaultSpeechPath_ = () => getProperty_('DEFAULT_SPEECH_PATH');
+
+// --- Environment separation (see the header comment) ---
+
+const optionalProperty_ = (name) => {
+  const value = PropertiesService.getScriptProperties().getProperty(name);
+  return value ? String(value).trim() : '';
+};
+
+export const spreadsheet_ = () => {
+  const id = optionalProperty_('SPREADSHEET_ID');
+  return id ? SpreadsheetApp.openById(id) : SpreadsheetApp.getActiveSpreadsheet();
+};
+
+export const sheetPrefix_ = () => optionalProperty_('SHEET_PREFIX');
+
+export const isDryRun_ = () => {
+  const value = optionalProperty_('DRY_RUN').toLowerCase();
+  return value === '1' || value === 'true';
+};
+
+// The one-shot alarms sheet. Production keeps the historical
+// behavior (the spreadsheet's active sheet); a prefixed environment
+// uses its own named sheet, created on first use.
+export const getAlarmSheet_ = () => {
+  const prefix = sheetPrefix_();
+  if (!prefix) {
+    return SpreadsheetApp.getActiveSheet();
+  }
+  const spreadsheet = spreadsheet_();
+  let sheet = spreadsheet.getSheetByName(prefix);
+  if (!sheet) {
+    sheet = spreadsheet.insertSheet(prefix);
+  }
+  return sheet;
+};
+
+export const rulesSheetName_ = () => {
+  const prefix = sheetPrefix_();
+  return prefix ? `${prefix}_rules` : RULES_SHEET_NAME;
+};
+
+export const shareSheetName_ = () => {
+  const prefix = sheetPrefix_();
+  return prefix ? `${prefix}_share_sessions` : SHARE_SHEET_NAME;
+};
 
 const pad2_ = (n) => String(n).padStart(2, '0');
 
@@ -199,7 +257,7 @@ export const upsertAlarm_ = (target, commands) => {
   const lock = LockService.getScriptLock();
   lock.waitLock(10000);
   try {
-    const sheet = SpreadsheetApp.getActiveSheet();
+    const sheet = getAlarmSheet_();
     const values = sheet.getDataRange().getValues();
     const now = new Date();
     let rowIndex = -1;
@@ -222,7 +280,7 @@ export const upsertAlarm_ = (target, commands) => {
 // The registered alarms as [{ target, commands }], oldest first.
 // Rows whose first cell is not a readable date are skipped.
 export const readAlarms_ = () => {
-  const sheet = SpreadsheetApp.getActiveSheet();
+  const sheet = getAlarmSheet_();
   const values = sheet.getDataRange().getValues();
   const now = new Date();
   const alarms = [];
@@ -245,7 +303,7 @@ export const deleteAlarm_ = (target) => {
   const lock = LockService.getScriptLock();
   lock.waitLock(10000);
   try {
-    const sheet = SpreadsheetApp.getActiveSheet();
+    const sheet = getAlarmSheet_();
     const values = sheet.getDataRange().getValues();
     const now = new Date();
     for (let i = 0; i < values.length; i++) {
@@ -317,10 +375,11 @@ const SHARE_HEADERS = [
 ];
 
 export const getShareSheet_ = () => {
-  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
-  let sheet = spreadsheet.getSheetByName(SHARE_SHEET_NAME);
+  const spreadsheet = spreadsheet_();
+  const name = shareSheetName_();
+  let sheet = spreadsheet.getSheetByName(name);
   if (!sheet) {
-    sheet = spreadsheet.insertSheet(SHARE_SHEET_NAME);
+    sheet = spreadsheet.insertSheet(name);
     sheet.appendRow(SHARE_HEADERS);
   }
   return sheet;
@@ -615,7 +674,12 @@ export const fireCells_ = (target, cells) => {
     // Old-format row ([time, text]): speak it like the old version.
     urls.unshift(apiBaseUrl_() + defaultSpeechCommand_(target, legacyTexts.join(' ')));
   }
+  const dryRun = isDryRun_();
   urls.slice(0, MAX_COMMANDS).forEach((url) => {
+    if (dryRun) {
+      Logger.log('[DRY_RUN] ' + url);
+      return;
+    }
     const res = UrlFetchApp.fetch(url, {
       muteHttpExceptions: true,
       method: 'get',
@@ -635,10 +699,11 @@ const ALL_WEEKDAYS_ = [0, 1, 2, 3, 4, 5, 6];
 const RULES_HEADERS = ['id', 'time', 'weekdays', 'until', 'last_fired', 'commands'];
 
 export const getRulesSheet_ = () => {
-  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
-  let sheet = spreadsheet.getSheetByName(RULES_SHEET_NAME);
+  const spreadsheet = spreadsheet_();
+  const name = rulesSheetName_();
+  let sheet = spreadsheet.getSheetByName(name);
   if (!sheet) {
-    sheet = spreadsheet.insertSheet(RULES_SHEET_NAME);
+    sheet = spreadsheet.insertSheet(name);
     sheet.appendRow(RULES_HEADERS);
   }
   return sheet;
@@ -821,8 +886,8 @@ export const deleteRule_ = (id) => {
 // (last_fired guards against the two trigger runs inside the
 // window). Rules past their until date are deleted.
 export const processRules_ = (now) => {
-  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = spreadsheet.getSheetByName(RULES_SHEET_NAME);
+  const spreadsheet = spreadsheet_();
+  const sheet = spreadsheet.getSheetByName(rulesSheetName_());
   if (!sheet) return;
   const values = sheet.getDataRange().getValues();
   const todayKey = formatDateKey_(now);
@@ -913,7 +978,7 @@ export const classify_ = (target, now) => {
 // Runs every minute from the time-driven trigger. The function name is
 // kept from the old version so the existing trigger keeps working.
 export const myFunction = () => {
-  const sheet = SpreadsheetApp.getActiveSheet();
+  const sheet = getAlarmSheet_();
   const values = sheet.getDataRange().getValues();
   const now = new Date();
   const deleteRows = [];

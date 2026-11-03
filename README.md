@@ -57,6 +57,12 @@ Example:
      it as `sync_token` in the JSON body. It cannot touch one-shot
      alarms or share sessions and does not expire; set the same value
      in the client script's properties.
+   - Staging only (optional): `SPREADSHEET_ID` opens that
+     spreadsheet instead of the container one, `SHEET_PREFIX`
+     (e.g. `stg`) moves this copy's data into prefixed sheets of
+     the same spreadsheet (`stg`, `stg_rules`, `stg_share_sessions`),
+     and `DRY_RUN` (`1` or `true`) logs command URLs instead of
+     calling them. Leave all three unset in production.
 3. Set `.clasp.json` to that project's script ID.
 4. Run `npm install`, `npm run build`, and `npm run deploy`
    (clasp push) to send `dist/` to the project.
