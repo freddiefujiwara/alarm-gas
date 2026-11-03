@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   buildSpeechText_,
   classify_,
@@ -6,12 +6,19 @@ import {
   defaultSpeechCommand_,
   doGet,
   doPost,
+  fireCells_,
+  getAlarmSheet_,
+  isDryRun_,
   myFunction,
   parseDateKey_,
   parseTarget_,
   parseTimeOfDay_,
   parseWeekdays_,
   processRules_,
+  rulesSheetName_,
+  shareSheetName_,
+  sheetPrefix_,
+  spreadsheet_,
   toUrl_,
 } from "../src/Code.js";
 
@@ -38,6 +45,7 @@ const mockSheet = {
 global.SpreadsheetApp = {
   getActiveSheet: vi.fn(() => mockSheet),
   getActiveSpreadsheet: vi.fn(() => mockSpreadsheet),
+  openById: vi.fn(() => mockSpreadsheet),
 };
 
 // ---- Share session mocks (mirror the health-gas test stubs) ----
@@ -764,5 +772,85 @@ describe("processRules_", () => {
   it("does nothing when the rules sheet does not exist", () => {
     rulesSheetExists = false;
     expect(() => processRules_(monday)).not.toThrow();
+  });
+});
+
+describe("environment separation (staging)", () => {
+  const BASE_PROPS = {
+    API_BASE_URL: "http://home-api.example",
+    DEFAULT_SPEECH_PATH: "/speak/-h/192.0.2.1/-v/60/-s/",
+    AVAILABLE_GMAILS: "owner@example.com",
+    GOOGLE_OAUTH_CLIENT_ID: "dummy-client-id",
+    SYNC_TOKEN: "test-sync-token",
+  };
+  const setProps = (extra) => {
+    global.PropertiesService.getScriptProperties.mockImplementation(() => ({
+      getProperty: (name) => ({ ...BASE_PROPS, ...extra })[name] || null,
+    }));
+  };
+
+  afterEach(() => {
+    setProps({});
+  });
+
+  it("defaults to the production sheets without a prefix", () => {
+    expect(sheetPrefix_()).toBe("");
+    expect(rulesSheetName_()).toBe("rules");
+    expect(shareSheetName_()).toBe("share_sessions");
+    expect(getAlarmSheet_()).toBe(mockSheet);
+    expect(isDryRun_()).toBe(false);
+  });
+
+  it("uses prefixed sheet names when SHEET_PREFIX is set", () => {
+    setProps({ SHEET_PREFIX: "stg" });
+    expect(sheetPrefix_()).toBe("stg");
+    expect(rulesSheetName_()).toBe("stg_rules");
+    expect(shareSheetName_()).toBe("stg_share_sessions");
+  });
+
+  it("opens the spreadsheet by ID when SPREADSHEET_ID is set", () => {
+    setProps({ SPREADSHEET_ID: "staging-spreadsheet-id" });
+    expect(spreadsheet_()).toBe(mockSpreadsheet);
+    expect(global.SpreadsheetApp.openById).toHaveBeenCalledWith("staging-spreadsheet-id");
+  });
+
+  it("uses the active spreadsheet without SPREADSHEET_ID", () => {
+    expect(spreadsheet_()).toBe(mockSpreadsheet);
+    expect(global.SpreadsheetApp.getActiveSpreadsheet).toHaveBeenCalled();
+  });
+
+  it("creates the prefixed one-shot sheet when missing", () => {
+    setProps({ SHEET_PREFIX: "stg" });
+    const sheet = getAlarmSheet_();
+    expect(mockSpreadsheet.getSheetByName).toHaveBeenCalledWith("stg");
+    expect(mockSpreadsheet.insertSheet).toHaveBeenCalledWith("stg");
+    expect(sheet).toBe(mockShareSheet);
+  });
+
+  it("returns the existing prefixed one-shot sheet", () => {
+    setProps({ SHEET_PREFIX: "stg" });
+    mockSpreadsheet.getSheetByName.mockImplementationOnce(() => mockSheet);
+    expect(getAlarmSheet_()).toBe(mockSheet);
+    expect(mockSpreadsheet.insertSheet).not.toHaveBeenCalled();
+  });
+
+  it("treats DRY_RUN=1 and DRY_RUN=true as dry-run, other values as off", () => {
+    setProps({ DRY_RUN: "1" });
+    expect(isDryRun_()).toBe(true);
+    setProps({ DRY_RUN: "true" });
+    expect(isDryRun_()).toBe(true);
+    setProps({ DRY_RUN: "yes" });
+    expect(isDryRun_()).toBe(false);
+  });
+
+  it("does not call the command API in dry-run mode", () => {
+    setProps({ DRY_RUN: "1" });
+    fireCells_(new Date(), ["switchbot-command -d X -c turnOff"]);
+    expect(fetched).toEqual([]);
+  });
+
+  it("calls the command API when dry-run is off", () => {
+    fireCells_(new Date(), ["switchbot-command -d X -c turnOff"]);
+    expect(fetched).toEqual(["http://home-api.example/switchbot-command/-d/X/-c/turnOff"]);
   });
 });
