@@ -79,6 +79,7 @@ const mockRulesSheet = {
 };
 
 const mockSpreadsheet = {
+  getActiveSheet: vi.fn(() => mockSheet),
   getSheetByName: vi.fn((name) => {
     if (name === "share_sessions") return shareSheetExists ? mockShareSheet : null;
     if (name === "rules") return rulesSheetExists ? mockRulesSheet : null;
@@ -812,6 +813,14 @@ describe("environment separation (staging)", () => {
     setProps({ SPREADSHEET_ID: "staging-spreadsheet-id" });
     expect(spreadsheet_()).toBe(mockSpreadsheet);
     expect(global.SpreadsheetApp.openById).toHaveBeenCalledWith("staging-spreadsheet-id");
+  });
+
+  it("uses the SPREADSHEET_ID spreadsheet's active sheet for one-shots without a prefix", () => {
+    setProps({ SPREADSHEET_ID: "staging-spreadsheet-id" });
+    expect(getAlarmSheet_()).toBe(mockSheet);
+    expect(global.SpreadsheetApp.openById).toHaveBeenCalledWith("staging-spreadsheet-id");
+    expect(mockSpreadsheet.getActiveSheet).toHaveBeenCalled();
+    expect(global.SpreadsheetApp.getActiveSheet).not.toHaveBeenCalled();
   });
 
   it("uses the active spreadsheet without SPREADSHEET_ID", () => {

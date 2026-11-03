@@ -16,11 +16,13 @@
 // Optional properties separate a staging copy of this script from
 // production. All are unset in production, where nothing changes:
 //   SPREADSHEET_ID Opens that spreadsheet instead of the container
-//                  spreadsheet (for a standalone staging copy).
+//                  spreadsheet, so a standalone staging copy keeps
+//                  all of its data (one-shots on the active sheet,
+//                  plus the rules / share sheets) in its own file.
 //   SHEET_PREFIX   This environment's sheet prefix. With "stg", the
 //                  one-shot alarms live in a sheet named "stg" and
 //                  the rules / share sheets are "stg_rules" /
-//                  "stg_share_sessions" in the same spreadsheet.
+//                  "stg_share_sessions" in the opened spreadsheet.
 //                  Without it, one-shots use the active sheet and
 //                  the sheets are "rules" / "share_sessions".
 //   DRY_RUN        "1" or "true": log command URLs instead of
@@ -109,13 +111,14 @@ export const isDryRun_ = () => {
   return value === '1' || value === 'true';
 };
 
-// The one-shot alarms sheet. Production keeps the historical
-// behavior (the spreadsheet's active sheet); a prefixed environment
-// uses its own named sheet, created on first use.
+// The one-shot alarms sheet: the active sheet of the opened
+// spreadsheet (the container spreadsheet in production, the
+// SPREADSHEET_ID file in a standalone copy). A prefixed environment
+// instead uses its own named sheet, created on first use.
 export const getAlarmSheet_ = () => {
   const prefix = sheetPrefix_();
   if (!prefix) {
-    return SpreadsheetApp.getActiveSheet();
+    return spreadsheet_().getActiveSheet();
   }
   const spreadsheet = spreadsheet_();
   let sheet = spreadsheet.getSheetByName(prefix);
