@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - "**"
+  pull_request:
+    branches:
+      - "**"
   workflow_dispatch:
 
 jobs:
@@ -12,61 +15,81 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - node-version: "18"
-            deploy: false
-          - node-version: "20"
-            deploy: false
-          - node-version: "22"
-            deploy: true
+        node-version: ["18", "20", "22"]
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: "${{ matrix.node-version }}"
-
       - name: Install deps
         run: npm install
-
       - name: Run tests
         run: npm test
 
+  deploy-staging:
+    needs: test
+    if: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref != 'refs/heads/main') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install deps
+        run: npm install
       - name: Build
-        if: ${{ matrix.deploy }}
         run: npm run build
-
       - name: Install clasp
-        if: ${{ matrix.deploy }}
         run: npm i -g @google/clasp
-
       - name: Write clasp credentials
-        if: ${{ matrix.deploy }}
         run: |
           echo '${{ secrets.CLASPRC_JSON }}' > ~/.clasprc.json
-
-      - name: Push dist to Apps Script
-        if: ${{ matrix.deploy }}
+      - name: Push dist to Apps Script (staging)
         run: clasp push --force
-
       - name: Create version
-        if: ${{ matrix.deploy }}
         id: version
         run: |
           OUT=$(clasp create-version "Auto deploy from Node CI")
           VER=$(echo "$OUT" | grep -Eo '[0-9]+' | tail -1)
           echo "ver=$VER" >> $GITHUB_OUTPUT
+      - name: Deploy (staging)
+        run: |
+          if [ -n "${{ secrets.STAGING_DEPLOYMENT_ID }}" ]; then
+            clasp update-deployment "${{ secrets.STAGING_DEPLOYMENT_ID }}" "${{ steps.version.outputs.ver }}"
+          else
+            clasp deploy --description "Staging deploy from Node CI" --deploymentId "${{ secrets.STAGING_DEPLOYMENT_ID }}"
+          fi
 
-      - name: Deploy
-        if: ${{ matrix.deploy }}
+  deploy-prod:
+    needs: test
+    if: ${{ github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install deps
+        run: npm install
+      - name: Build
+        run: npm run build
+      - name: Install clasp
+        run: npm i -g @google/clasp
+      - name: Write clasp credentials
+        run: |
+          echo '${{ secrets.CLASPRC_JSON }}' > ~/.clasprc.json
+      - name: Push dist to Apps Script (production)
+        run: clasp push --force
+      - name: Create version
+        id: version
+        run: |
+          OUT=$(clasp create-version "Auto deploy from Node CI")
+          VER=$(echo "$OUT" | grep -Eo '[0-9]+' | tail -1)
+          echo "ver=$VER" >> $GITHUB_OUTPUT
+      - name: Deploy (production)
         run: |
           if [ -n "${{ secrets.DEPLOYMENT_ID }}" ]; then
-            clasp update-deployment \
-              "${{ secrets.DEPLOYMENT_ID }}" \
-              -V "${{ steps.version.outputs.ver }}" \
-              -d "Auto deploy from Node CI"
+            clasp update-deployment "${{ secrets.DEPLOYMENT_ID }}" "${{ steps.version.outputs.ver }}"
           else
-            clasp create-deployment \
-              -V "${{ steps.version.outputs.ver }}" \
-              -d "Auto deploy from Node CI"
+            clasp deploy --description "Production deploy from Node CI" --deploymentId "${{ secrets.DEPLOYMENT_ID }}"
           fi
