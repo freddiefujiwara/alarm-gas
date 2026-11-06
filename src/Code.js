@@ -90,6 +90,7 @@ const getProperty_ = (name) => {
 };
 
 const apiBaseUrl_ = () => getProperty_('API_BASE_URL');
+const apiToken_ = () => getProperty_('HOME_API_TOKEN');
 const defaultSpeechPath_ = () => getProperty_('DEFAULT_SPEECH_PATH');
 
 // --- Environment separation (see the header comment) ---
@@ -683,10 +684,14 @@ export const fireCells_ = (target, cells) => {
       Logger.log('[DRY_RUN] ' + url);
       return;
     }
-    const res = UrlFetchApp.fetch(url, {
+    const options = {
       muteHttpExceptions: true,
       method: 'get',
-    });
+    };
+    if (url.startsWith(apiBaseUrl_())) {
+      options.headers = { 'X-Api-Token': apiToken_() };
+    }
+    const res = UrlFetchApp.fetch(url, options);
     Logger.log(url + ' -> ' + res.getResponseCode());
   });
 };
