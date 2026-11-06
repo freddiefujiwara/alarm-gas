@@ -29,6 +29,7 @@ let deletedRows;
 let rangeSets;
 let rangeClears;
 let fetched;
+let fetchedOptions;
 let outputContent;
 let outputMime;
 
@@ -126,7 +127,7 @@ global.LockService = {
 };
 let tokenInfo;
 global.UrlFetchApp = {
-  fetch: vi.fn((url) => {
+  fetch: vi.fn((url, options) => {
     if (String(url).startsWith("https://oauth2.googleapis.com/tokeninfo")) {
       return {
         getResponseCode: () => tokenInfo.code,
@@ -134,6 +135,7 @@ global.UrlFetchApp = {
       };
     }
     fetched.push(url);
+    fetchedOptions.push(options);
     return { getResponseCode: () => 200, getContentText: () => "OK" };
   }),
 };
@@ -147,6 +149,7 @@ global.PropertiesService = {
           DEFAULT_SPEECH_PATH: "/speak/-h/192.0.2.1/-v/60/-s/",
           AVAILABLE_GMAILS: "owner@example.com",
           GOOGLE_OAUTH_CLIENT_ID: "dummy-client-id",
+          HOME_API_TOKEN: "dummy-home-api-token",
           SYNC_TOKEN: "test-sync-token",
         })[name] || null
     ),
@@ -160,6 +163,7 @@ beforeEach(() => {
   rangeSets = [];
   rangeClears = [];
   fetched = [];
+  fetchedOptions = [];
   outputContent = null;
   outputMime = null;
   uuidCounter = 0;
@@ -332,6 +336,17 @@ describe("myFunction", () => {
       "http://home-api.example/hue/lights/off",
       "http://home-api.example/switchbot-command/-d/X/-c/turnOff",
     ]);
+    expect(fetchedOptions.map((o) => o && o.headers)).toEqual([
+      { "X-Api-Token": "dummy-home-api-token" },
+      { "X-Api-Token": "dummy-home-api-token" },
+    ]);
+    expect(deletedRows).toEqual([1]);
+  });
+  it("fires a full external URL without the home API token header", () => {
+    sheetValues = [[new Date(), "https://example.com/hook"]];
+    myFunction();
+    expect(fetched).toEqual(["https://example.com/hook"]);
+    expect(fetchedOptions[0].headers).toBeUndefined();
     expect(deletedRows).toEqual([1]);
   });
   it("deletes an overdue row without firing", () => {
@@ -782,6 +797,7 @@ describe("environment separation (staging)", () => {
     DEFAULT_SPEECH_PATH: "/speak/-h/192.0.2.1/-v/60/-s/",
     AVAILABLE_GMAILS: "owner@example.com",
     GOOGLE_OAUTH_CLIENT_ID: "dummy-client-id",
+    HOME_API_TOKEN: "dummy-home-api-token",
     SYNC_TOKEN: "test-sync-token",
   };
   const setProps = (extra) => {
