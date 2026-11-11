@@ -79,10 +79,24 @@ const mockRulesSheet = {
   })),
 };
 
+let ownerValues;
+let ownerSheetExists;
+
+const mockOwnerSheet = {
+  getDataRange: vi.fn(() => ({ getValues: vi.fn(() => ownerValues) })),
+  appendRow: vi.fn((row) => ownerValues.push([...row])),
+  getRange: vi.fn((row, col) => ({
+    setValue: vi.fn((value) => {
+      ownerValues[row - 1][col - 1] = value;
+    }),
+  })),
+};
+
 const mockSpreadsheet = {
   getActiveSheet: vi.fn(() => mockSheet),
   getSheetByName: vi.fn((name) => {
     if (name === "share_sessions") return shareSheetExists ? mockShareSheet : null;
+    if (name === "owner_sessions") return ownerSheetExists ? mockOwnerSheet : null;
     if (name === "rules") return rulesSheetExists ? mockRulesSheet : null;
     return null;
   }),
@@ -90,6 +104,10 @@ const mockSpreadsheet = {
     if (name === "rules") {
       rulesSheetExists = true;
       return mockRulesSheet;
+    }
+    if (name === "owner_sessions") {
+      ownerSheetExists = true;
+      return mockOwnerSheet;
     }
     shareSheetExists = true;
     shareInserted += 1;
@@ -170,6 +188,10 @@ beforeEach(() => {
   shareSheetExists = true;
   shareInserted = 0;
   shareValues = [
+    ["token_hash", "issued_at", "expires_at", "revoked_at", "access_count", "last_accessed_at"],
+  ];
+  ownerSheetExists = true;
+  ownerValues = [
     ["token_hash", "issued_at", "expires_at", "revoked_at", "access_count", "last_accessed_at"],
   ];
   rulesSheetExists = true;
@@ -616,6 +638,69 @@ describe("doPost share sessions", () => {
     expect(resultJson().ok).toBe(false);
     expect(resultJson().status).toBe(401);
     expect(shareValues).toHaveLength(2);
+  });
+});
+
+describe("doPost owner sessions", () => {
+  const post = (body) => doPost({ postData: { contents: JSON.stringify(body) } });
+  const auth = { idToken: "dummy-token" };
+  const exchange = () => {
+    post({ ...auth, action: "exchange_session" });
+    return resultJson();
+  };
+
+  it("exchanges a Google ID token for a 30-day owner session", () => {
+    const before = Date.now();
+    const result = exchange();
+    expect(result.ok).toBe(true);
+    expect(result.session_token).toMatch(/^[0-9a-f]{64}$/);
+    expect(Date.parse(result.expires_at) - before).toBeGreaterThan(29 * 24 * 60 * 60 * 1000);
+    expect(ownerValues).toHaveLength(2);
+    expect(ownerValues[1][0]).toBe(shareHashOf(result.session_token));
+    expect(ownerValues[1][0]).not.toBe(result.session_token);
+  });
+
+  it("rejects the exchange when the ID token is invalid", () => {
+    tokenInfo = { code: 400, payload: {} };
+    post({ idToken: "bad", action: "exchange_session" });
+    expect(resultJson().ok).toBe(false);
+  });
+
+  it("lets the owner session list and set alarms", () => {
+    const { session_token } = exchange();
+    sheetValues = [[new Date(2999, 0, 1, 4, 50, 0), "/speak/x"]];
+    post({ action: "list", session_token });
+    expect(resultJson().ok).toBe(true);
+    post({ action: "set", session_token, time: "29990101-04:50", commands: ["/a"] });
+    expect(resultJson().ok).toBe(true);
+    expect(ownerValues[1][4]).toBe(2);
+  });
+
+  it("rejects an unknown or expired session token", () => {
+    post({ action: "list", session_token: "nope" });
+    expect(resultJson()).toEqual({
+      ok: false,
+      status: 401,
+      error: "session expired or invalid",
+    });
+  });
+
+  it("revokes the session on revoke_session (logout)", () => {
+    const { session_token } = exchange();
+    post({ action: "revoke_session", session_token });
+    expect(resultJson()).toEqual({ ok: true, revoked: true });
+    expect(ownerValues[1][3]).not.toBe("");
+    post({ action: "list", session_token });
+    expect(resultJson().ok).toBe(false);
+  });
+
+  it("lets an owner session issue and revoke share links", () => {
+    const { session_token } = exchange();
+    post({ action: "issue_share", session_token });
+    expect(resultJson().ok).toBe(true);
+    expect(resultJson().share_token).toMatch(/^[0-9a-f]{64}$/);
+    post({ action: "revoke_share", session_token });
+    expect(resultJson()).toEqual({ ok: true, revoked: true });
   });
 });
 
