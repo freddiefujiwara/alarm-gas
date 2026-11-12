@@ -2,7 +2,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   buildSpeechText_,
   classify_,
-  collectRequestCommands_,
   defaultSpeechCommand_,
   doGet,
   doPost,
@@ -253,75 +252,26 @@ describe("speech helpers", () => {
   });
 });
 
-describe("collectRequestCommands_", () => {
-  const target = new Date(2026, 10, 2, 7, 30);
-  it("collects repeated cmd parameters", () => {
-    const e = ev({}, { cmd: ["/hue/lights/off", " /x ", ""] });
-    expect(collectRequestCommands_(e, target)).toEqual(["/hue/lights/off", "/x"]);
-  });
-  it("falls back to a default speech command for legacy text", () => {
-    const e = ev({ text: "おはよう" });
-    const cmds = collectRequestCommands_(e, target);
-    expect(cmds).toHaveLength(1);
-    expect(cmds[0]).toContain("/speak/-h/192.0.2.1/");
-  });
-  it("falls back to the time announcement when nothing is given", () => {
-    const cmds = collectRequestCommands_(ev({}), target);
-    expect(cmds).toHaveLength(1);
-    expect(decodeURIComponent(cmds[0].split("/-s/")[1])).toBe(
-      "7時30分です。時間ですよ。時間ですよ。そろそろ時間ですよ。"
-    );
-  });
-});
 
-describe("doGet", () => {
-  it("registers a new alarm", () => {
+
+describe("doGet (anonymous registration removed)", () => {
+  it("refuses a command registration and writes nothing", () => {
     const e = ev({ time: "29990101-04:50", cmd: "/hue/lights/off" }, { cmd: ["/hue/lights/off"] });
     doGet(e);
-    expect(resultJson()).toEqual({ ok: true, time: "29990101-04:50", commands: 1 });
-    expect(appended).toHaveLength(1);
-    expect(appended[0][1]).toBe("/hue/lights/off");
-    expect(appended[0][0]).toEqual(new Date(2999, 0, 1, 4, 50, 0));
-  });
-  it("rejects a past time", () => {
-    doGet(ev({ time: "20200101-04:50", cmd: "/x" }, { cmd: ["/x"] }));
     expect(resultJson().ok).toBe(false);
-    expect(resultJson().error).toContain("past");
+    expect(resultJson().error).toContain("disabled");
+    expect(appended).toHaveLength(0);
+    expect(rangeSets).toHaveLength(0);
+  });
+  it("refuses a legacy text registration and writes nothing", () => {
+    doGet(ev({ time: "29990101-04:50", text: "おはよう" }));
+    expect(resultJson().ok).toBe(false);
     expect(appended).toHaveLength(0);
   });
-  it("rejects more than 10 commands", () => {
-    const cmds = Array.from({ length: 11 }, (_, i) => `/c${i}`);
-    doGet(ev({ time: "29990101-04:50" }, { cmd: cmds }));
+  it("refuses even a bare request", () => {
+    doGet(ev({}));
     expect(resultJson().ok).toBe(false);
-    expect(resultJson().error).toContain("10");
     expect(appended).toHaveLength(0);
-  });
-  it("rejects a bad format", () => {
-    doGet(ev({ time: "soon", cmd: "/x" }, { cmd: ["/x"] }));
-    expect(resultJson().ok).toBe(false);
-  });
-  it("registers a time announcement alarm when neither cmd nor text is given", () => {
-    doGet(ev({ time: "29990101-04:50" }));
-    expect(resultJson()).toEqual({ ok: true, time: "29990101-04:50", commands: 1 });
-    expect(appended).toHaveLength(1);
-    expect(appended[0][1]).toContain("/speak/-h/192.0.2.1/");
-    expect(decodeURIComponent(appended[0][1].split("/-s/")[1])).toBe(
-      "4時50分です。時間ですよ。時間ですよ。そろそろ時間ですよ。"
-    );
-  });
-  it("overwrites an existing row for the same datetime", () => {
-    const existing = new Date(2999, 0, 1, 4, 50, 0);
-    sheetValues = [[existing, "/old"]];
-    doGet(ev({ time: "29990101-04:50", cmd: "/new" }, { cmd: ["/new"] }));
-    expect(resultJson().ok).toBe(true);
-    expect(appended).toHaveLength(0);
-    expect(rangeClears).toHaveLength(1);
-    expect(rangeSets[0][0][1]).toBe("/new");
-  });
-  it("answers JSONP when a callback is given", () => {
-    doGet(ev({ time: "29990101-04:50", cmd: "/x", callback: "_cb" }, { cmd: ["/x"] }));
-    expect(outputMime).toBe("JAVASCRIPT");
-    expect(outputContent.startsWith("_cb&&_cb(")).toBe(true);
   });
 });
 

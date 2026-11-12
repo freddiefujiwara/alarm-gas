@@ -34,15 +34,9 @@
 //                 command API (for example "/hue/lights/off")
 //                 or a full URL.
 //
-// Web API (doGet, legacy and anonymous, used by ha.ze.gs):
-//   time     "HH:MM" or "HH:MM:SS" (today), or "YYYYMMDD-HH:MM".
-//   cmd      A command. Repeat the parameter to register up to 10.
-//   text     Legacy speech text. When no cmd is given, one default
-//            speech command for the Nest speaker is registered
-//            instead, like the old version did. The text is optional:
-//            with no text at all, the alarm just announces the time
-//            (for example "7時30分です。"), also like the old version.
-//   callback Legacy JSONP callback name.
+// Web API (doGet): disabled. The legacy anonymous registration API
+// was removed because it executed free-form home commands with no
+// authentication; see the doGet stub below.
 //
 // Web API (doPost, JSON body, used by the alarm frontend):
 //   Actions require a Google ID token in "idToken"; the token
@@ -202,26 +196,6 @@ export const buildSpeechText_ = (target, text) =>
 export const defaultSpeechCommand_ = (target, text) =>
   defaultSpeechPath_() + encodeURIComponent(buildSpeechText_(target, text));
 
-// Commands from the request. When no cmd is given, this falls back
-// to one default speech command: with the legacy "text" when present,
-// or the time announcement (with its nudge suffix) when it is not.
-export const collectRequestCommands_ = (e, target) => {
-  const params = (e && e.parameters) || {};
-  let cmds = [];
-  if (Array.isArray(params.cmd)) {
-    cmds = params.cmd.slice();
-  } else if (e && e.parameter && e.parameter.cmd) {
-    cmds = [e.parameter.cmd];
-  }
-  cmds = cmds.map((c) => String(c).trim()).filter((c) => c.length > 0);
-  if (cmds.length === 0) {
-    const raw = e && e.parameter ? e.parameter.text : null;
-    const text = raw ? String(raw).trim() : '';
-    cmds = [defaultSpeechCommand_(target, text)];
-  }
-  return cmds;
-};
-
 const respond_ = (e, payload) => {
   const output = ContentService.createTextOutput();
   const callback = e && e.parameter ? e.parameter.callback : undefined;
@@ -236,29 +210,17 @@ const respond_ = (e, payload) => {
   return output;
 };
 
-export const doGet = (e) => {
-  const params = (e && e.parameter) || {};
-  const now = new Date();
-  const target = parseTarget_(params.time || '', now);
-  if (!target) {
-    return respond_(e, {
-      ok: false,
-      error: 'invalid time format: use HH:MM or YYYYMMDD-HH:MM',
-    });
-  }
-  if (target.getTime() <= now.getTime()) {
-    return respond_(e, { ok: false, error: 'time is in the past' });
-  }
-  const commands = collectRequestCommands_(e, target);
-  if (commands.length > MAX_COMMANDS) {
-    return respond_(e, {
-      ok: false,
-      error: `too many commands: max is ${MAX_COMMANDS}`,
-    });
-  }
-  upsertAlarm_(target, commands);
-  return respond_(e, { ok: true, time: formatTarget_(target), commands: commands.length });
-};
+// The legacy anonymous doGet registration was removed: it let anyone
+// who knew the /exec URL register arbitrary home-API commands (device
+// control, speaker text, arbitrary URL fetches) with no credential at
+// all. Registration is only available through the authenticated
+// doPost API below. doGet stays as a stub so old callers get a clear
+// error instead of a silent success.
+export const doGet = (e) =>
+  respond_(e, {
+    ok: false,
+    error: 'doGet registration is disabled; use the authenticated API',
+  });
 
 // Write one alarm row, overwriting the row for the same minute when
 // one already exists.
