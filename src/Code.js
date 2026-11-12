@@ -393,8 +393,6 @@ export const getSessionSheet_ = (name) => {
   return sheet;
 };
 
-export const getShareSheet_ = () => getSessionSheet_(shareSheetName_());
-
 export const hashShareToken_ = (token) =>
   Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, String(token))
     .map((byte) => ((byte % 256) + 256) % 256)
@@ -406,8 +404,6 @@ export const readSessionRows_ = (name) => {
   const values = sheet.getDataRange().getValues();
   return { sheet, values };
 };
-
-export const readShareRows_ = () => readSessionRows_(shareSheetName_());
 
 export const shareCellIso_ = (value) => {
   if (!value) {
