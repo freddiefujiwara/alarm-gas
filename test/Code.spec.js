@@ -610,6 +610,19 @@ describe("doPost owner sessions", () => {
     expect(ownerValues[1][0]).not.toBe(result.session_token);
   });
 
+  it("keeps previous owner sessions valid when a new one is exchanged", () => {
+    const first = exchange().session_token;
+    const second = exchange().session_token;
+    expect(first).not.toBe(second);
+    expect(ownerValues).toHaveLength(3);
+    expect(ownerValues[1][3]).toBe("");
+    expect(ownerValues[2][3]).toBe("");
+    post({ action: "list", session_token: first });
+    expect(resultJson().ok).toBe(true);
+    post({ action: "list", session_token: second });
+    expect(resultJson().ok).toBe(true);
+  });
+
   it("rejects the exchange when the ID token is invalid", () => {
     tokenInfo = { code: 400, payload: {} };
     post({ idToken: "bad", action: "exchange_session" });
