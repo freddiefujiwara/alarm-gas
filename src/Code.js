@@ -140,6 +140,17 @@ export const ownerSheetName_ = () => {
 
 const pad2_ = (n) => String(n).padStart(2, '0');
 
+// A value from outside (a request body field, a sheet cell) as text:
+// strings pass through, numbers and booleans stringify as String()
+// always did, and anything else (arrays, plain objects, values whose
+// toString is not callable) reads as empty instead of throwing or
+// leaking "[object Object]".
+const cellText_ = (value) => {
+  if (typeof value === 'string') return value;
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value);
+  return '';
+};
+
 // "HH:MM", "HH:MM:SS" -> today at that time.
 // "YYYYMMDD-HH:MM" (seconds optional) -> that date and time.
 // Anything else -> null.
@@ -192,9 +203,18 @@ export const EMPTY_TEXT_SUFFIX_ = '時間ですよ。時間ですよ。そろそ
 export const buildSpeechText_ = (target, text) =>
   `${target.getHours() % 12 || 12}時${target.getMinutes() ? target.getMinutes() + '分' : 'ちょうど'}です。${text ? text : EMPTY_TEXT_SUFFIX_}`;
 
+// encodeURIComponent throws on a lone surrogate, and a JSON string
+// escape can carry one into a request text; speak a replacement
+// character instead (well-formed pairs pass through untouched).
+const speakableText_ = (text) =>
+  text.replace(
+    /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g,
+    '\uFFFD'
+  );
+
 // A speech command (path on the home command API) for legacy text.
 export const defaultSpeechCommand_ = (target, text) =>
-  defaultSpeechPath_() + encodeURIComponent(buildSpeechText_(target, text));
+  defaultSpeechPath_() + encodeURIComponent(speakableText_(buildSpeechText_(target, text)));
 
 const respond_ = (e, payload) => {
   const output = ContentService.createTextOutput();
@@ -419,7 +439,7 @@ export const revokeShareSession_ = () => {
 };
 
 export const validateSessionToken_ = (name, token) => {
-  if (!token) {
+  if (typeof token !== 'string' || !token) {
     return null;
   }
   const hash = hashShareToken_(token);
@@ -466,7 +486,7 @@ export const validateOwnerToken_ = (token) =>
   validateSessionToken_(ownerSheetName_(), token);
 
 export const revokeOwnerSession_ = (token) => {
-  if (token) {
+  if (typeof token === 'string' && token) {
     const hash = hashShareToken_(token);
     const { sheet, values } = readSessionRows_(ownerSheetName_());
     const nowIso = new Date().toISOString();
@@ -500,11 +520,11 @@ export const requireOwnerAuth_ = (body) => {
 const SYNC_ACTIONS_ = ['list_rules', 'set_rule', 'delete_rule'];
 
 export const validateSyncToken_ = (token) => {
-  if (!token) {
+  if (typeof token !== 'string' || !token) {
     return false;
   }
   const expected = getProperty_('SYNC_TOKEN');
-  return !!expected && String(token) === expected;
+  return !!expected && token === expected;
 };
 
 // Commands for a doPost "set" body: an explicit commands array wins;
@@ -512,10 +532,10 @@ export const validateSyncToken_ = (token) => {
 export const collectBodyCommands_ = (body, target) => {
   let cmds = [];
   if (Array.isArray(body.commands)) {
-    cmds = body.commands.map((c) => String(c).trim()).filter((c) => c.length > 0);
+    cmds = body.commands.map((c) => cellText_(c).trim()).filter((c) => c.length > 0);
   }
   if (cmds.length === 0) {
-    const text = body.text ? String(body.text).trim() : '';
+    const text = body.text ? cellText_(body.text).trim() : '';
     cmds = [defaultSpeechCommand_(target, text)];
   }
   return cmds;
@@ -539,6 +559,10 @@ export const doPost = (e) => {
     body = JSON.parse((e && e.postData && e.postData.contents) || '');
   } catch (err) {
     return jsonOut_({ ok: false, error: 'invalid JSON body' });
+  }
+  if (body === null) {
+    // A JSON "null" body parses fine but has no fields to read.
+    body = {};
   }
 
   // Exchanging a Google ID token for a 30-day owner session is how a
@@ -639,7 +663,15 @@ export const doPost = (e) => {
   }
 
   if (body.action === 'delete_rule') {
-    const id = body.id ? String(body.id).trim() : '';
+    // Only a string id, or a number (Sheets stores a bare id as a
+    // number), names a rule; anything else is not an id at all, so an
+    // array wrapping an id cannot delete that rule by coercion.
+    const id =
+      typeof body.id === 'string'
+        ? body.id.trim()
+        : typeof body.id === 'number'
+          ? String(body.id)
+          : '';
     if (!id) {
       return jsonOut_({ ok: false, error: 'missing rule id' });
     }
@@ -779,11 +811,25 @@ export const formatDateTimeKey_ = (d) =>
 // An empty input means every day.
 export const parseWeekdays_ = (value) => {
   if (value == null || value === '') return ALL_WEEKDAYS_.slice();
-  const items = Array.isArray(value) ? value : String(value).split(',');
+  let items;
+  if (Array.isArray(value)) {
+    items = value;
+  } else if (typeof value === 'string' || typeof value === 'number') {
+    items = String(value).split(',');
+  } else {
+    return null;
+  }
   const days = [];
   for (const item of items) {
     if (typeof item === 'string' && item.trim() === '') continue;
-    const n = Number(item);
+    // Only a day number, or its string form, counts as a day: a bare
+    // Number() would invent days from true (1) or false/null/[] (0).
+    const n =
+      typeof item === 'number'
+        ? item
+        : typeof item === 'string'
+          ? Number(item)
+          : NaN;
     if (!Number.isInteger(n) || n < 0 || n > 6) return null;
     if (!days.includes(n)) days.push(n);
   }
@@ -800,6 +846,7 @@ export const parseDateKey_ = (value) => {
   if (value instanceof Date) {
     return isNaN(value.getTime()) ? null : formatDateKey_(value);
   }
+  if (typeof value !== 'string' && typeof value !== 'number') return null;
   const digits = String(value).replace(/\D/g, '');
   if (!/^\d{8}$/.test(digits)) return null;
   const year = +digits.slice(0, 4);
@@ -820,6 +867,7 @@ export const parseLastFired_ = (value) => {
   if (value instanceof Date) {
     return isNaN(value.getTime()) ? '' : formatDateTimeKey_(value);
   }
+  if (typeof value !== 'string' && typeof value !== 'number') return '';
   const digits = String(value).replace(/\D/g, '');
   if (!/^\d{8}(\d{4})?$/.test(digits)) return '';
   if (parseDateKey_(digits.slice(0, 8)) === null) return '';
@@ -838,24 +886,24 @@ export const parseRuleTimeCell_ = (value) => {
     if (isNaN(value.getTime())) return null;
     return { hour: value.getHours(), minute: value.getMinutes() };
   }
-  return parseTimeOfDay_(value == null ? '' : String(value));
+  return parseTimeOfDay_(cellText_(value));
 };
 
 // One rules-sheet row -> a rule object, or null when the row is not a
 // readable rule (blank rows are handled by the caller).
 export const rowToRule_ = (row) => {
-  const id = String(row[0] == null ? '' : row[0]).trim();
+  const id = cellText_(row[0]).trim();
   if (!id) return null;
   const time = parseRuleTimeCell_(row[1]);
   if (!time) return null;
-  const weekdays = parseWeekdays_(row[2] == null ? '' : String(row[2]));
+  const weekdays = parseWeekdays_(row[2]);
   if (!weekdays) return null;
   const until = parseDateKey_(row[3]);
   if (until === null) return null;
   const lastFired = parseLastFired_(row[4]);
   const commands = row
     .slice(5)
-    .map((c) => String(c == null ? '' : c).trim())
+    .map((c) => cellText_(c).trim())
     .filter((c) => c.length > 0);
   return { id, hour: time.hour, minute: time.minute, weekdays, until, lastFired, commands };
 };
