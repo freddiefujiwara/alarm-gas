@@ -119,11 +119,20 @@ const leavePresence = (ageSec, since = T_LEAVE) => ({
   ageSec,
 });
 
-const tempFeed = (temperature, date = "11/22/2026 12:40:00 AM") =>
+// The setting values mirror the sheet: heat starts at or below
+// hot_buttom (23.7), cooling starts at or above cool_up (27.5).
+// The default date is an ISO instant 200 seconds before the case-2
+// "now", so the freshness check does not depend on the test
+// runner's timezone (the real feed's en-US date string is covered
+// by the parseTemperatureFeed_ unit tests instead).
+const tempFeed = (temperature, date = "2026-11-22T00:40:00.000Z", setting) =>
   `cb&&cb(${JSON.stringify({
     conditions: [{ Date: date, Temperature: temperature, Humid: 40 }],
     status: "off",
-    setting: {},
+    setting:
+      setting === undefined
+        ? { hot_buttom: 23.7, hot_up: 26.5, cool_up: 27.5, cool_buttom: 26, hot: 27, cool: 28 }
+        : setting,
   })});`;
 
 beforeEach(() => {
@@ -303,43 +312,58 @@ describe("processPresence_", () => {
 });
 
 describe("parseTemperatureFeed_", () => {
-  it("reads the latest entry of the JSONP feed", () => {
+  it("reads the latest entry and the sheet thresholds of the JSONP feed", () => {
     const parsed = parseTemperatureFeed_(tempFeed(25.3));
     expect(parsed.temperature).toBe(25.3);
-    expect(parsed.timeMs).toBe(new Date("11/22/2026 12:40:00 AM").getTime());
+    expect(parsed.timeMs).toBe(new Date("2026-11-22T00:40:00.000Z").getTime());
+    expect(parsed.heatBelow).toBe(23.7);
+    expect(parsed.coolAbove).toBe(27.5);
   });
   it("reads plain JSON too", () => {
     const parsed = parseTemperatureFeed_(
-      JSON.stringify({ conditions: [{ Date: "11/22/2026 12:40:00 AM", Temperature: 19 }] })
+      JSON.stringify({
+        conditions: [{ Date: "11/22/2026 12:40:00 AM", Temperature: 19 }],
+        setting: { hot_buttom: 23.7, cool_up: 27.5 },
+      })
     );
     expect(parsed.temperature).toBe(19);
+    expect(parsed.heatBelow).toBe(23.7);
   });
   it("is null for unusable bodies", () => {
     expect(parseTemperatureFeed_("not json")).toBeNull();
     expect(parseTemperatureFeed_(JSON.stringify({ conditions: [] }))).toBeNull();
     expect(
       parseTemperatureFeed_(
-        JSON.stringify({ conditions: [{ Date: "11/22/2026 12:40:00 AM", Temperature: "hot" }] })
+        JSON.stringify({
+          conditions: [{ Date: "11/22/2026 12:40:00 AM", Temperature: "hot" }],
+          setting: { hot_buttom: 23.7, cool_up: 27.5 },
+        })
       )
     ).toBeNull();
     expect(parseTemperatureFeed_(null)).toBeNull();
   });
+  it("is null when the setting thresholds are missing", () => {
+    expect(parseTemperatureFeed_(tempFeed(20, "11/22/2026 12:40:00 AM", {}))).toBeNull();
+    expect(
+      parseTemperatureFeed_(
+        JSON.stringify({ conditions: [{ Date: "11/22/2026 12:40:00 AM", Temperature: 20 }] })
+      )
+    ).toBeNull();
+  });
 });
 
 describe("decideTatamiAcMode_", () => {
-  it("heats below 20, cools above 27, and rests in between by default", () => {
-    expect(decideTatamiAcMode_(19.9)).toBe("heat");
-    expect(decideTatamiAcMode_(20)).toBeNull();
-    expect(decideTatamiAcMode_(24)).toBeNull();
-    expect(decideTatamiAcMode_(27)).toBeNull();
-    expect(decideTatamiAcMode_(27.1)).toBe("cool");
-    expect(decideTatamiAcMode_(NaN)).toBeNull();
-  });
-  it("honours threshold properties over the defaults", () => {
-    props.PRESENCE_AC_HEAT_BELOW = "22";
-    props.PRESENCE_AC_COOL_ABOVE = "26";
-    expect(decideTatamiAcMode_(21)).toBe("heat");
-    expect(decideTatamiAcMode_(26.5)).toBe("cool");
+  const sheet = { heatBelow: 23.7, coolAbove: 27.5 };
+  it("heats at or below hot_buttom, cools at or above cool_up, rests in between", () => {
+    expect(decideTatamiAcMode_(23.7, sheet)).toBe("heat");
+    expect(decideTatamiAcMode_(18, sheet)).toBe("heat");
+    expect(decideTatamiAcMode_(23.8, sheet)).toBeNull();
+    expect(decideTatamiAcMode_(25, sheet)).toBeNull();
+    expect(decideTatamiAcMode_(27.4, sheet)).toBeNull();
+    expect(decideTatamiAcMode_(27.5, sheet)).toBe("cool");
+    expect(decideTatamiAcMode_(30, sheet)).toBe("cool");
+    expect(decideTatamiAcMode_(NaN, sheet)).toBeNull();
+    expect(decideTatamiAcMode_(20, null)).toBeNull();
   });
 });
 
@@ -387,7 +411,17 @@ describe("processPresence_ tatami air conditioner (case 2)", () => {
 
   it("does nothing for a stale temperature and stays undecided", () => {
     enableAc();
-    tempResponse = tempFeed(18, "11/21/2026 10:40:00 PM");
+    tempResponse = tempFeed(18, "2026-11-21T22:40:00.000Z");
+    const result = processPresence_(now);
+    expect(result.fired).toEqual([]);
+    expect(result.ac).toBe("temperature unknown");
+    const state = JSON.parse(props.PRESENCE_STATE);
+    expect(state.acArriveSince).toBeUndefined();
+  });
+
+  it("does nothing when the feed carries no sheet thresholds", () => {
+    enableAc();
+    tempResponse = tempFeed(18, "2026-11-22T00:40:00.000Z", {});
     const result = processPresence_(now);
     expect(result.fired).toEqual([]);
     expect(result.ac).toBe("temperature unknown");

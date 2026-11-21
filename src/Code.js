@@ -48,19 +48,17 @@
 //                       air-condition status endpoint (the JSONP
 //                       export the home page reads, with a callback
 //                       parameter). Its latest conditions entry
-//                       supplies the temperature and its timestamp.
+//                       supplies the temperature and its timestamp,
+//                       and its setting values supply the thresholds
+//                       (heat at or below "hot_buttom", cool at or
+//                       above "cool_up" — the thresholds written in
+//                       the sheet, as the owner directed).
 //   PRESENCE_TATAMI_AC_HEAT_COMMAND / PRESENCE_TATAMI_AC_COOL_COMMAND
 //                       The single home-API commands that start the
 //                       tatami air conditioner on heating / cooling
 //                       (the switchbot-custom "Hot" / "Cool" commands
 //                       the alarm page already sends). Device
 //                       identifiers live only in these properties.
-//   PRESENCE_AC_HEAT_BELOW / PRESENCE_AC_COOL_ABOVE
-//                       Tatami thresholds in degrees: on arrival,
-//                       heat below the first, cool above the second,
-//                       and do nothing in between. Defaults are 20
-//                       and 27 (a starting proposal, not the living
-//                       room's air-condition settings).
 //
 // Sheet layout (the sheet is machine-managed; there is no header row):
 //   Column A:     datetime to fire (a Date value)
@@ -1298,22 +1296,17 @@ export const shouldHandleLeave_ = (presence, handledSince) => {
 // through PRESENCE_TEMP_URL so the source can be swapped without a
 // code change. A reading older than PRESENCE_TEMP_MAX_AGE_SEC_ (or
 // an unreadable feed) counts as "unknown" and nothing runs. The
-// thresholds are tatami-specific (see the header comment); the
-// living room's air-condition settings are never consulted here.
+// thresholds are the setting values carried in the same feed —
+// the ones written in the sheet (heat at or below "hot_buttom",
+// cool at or above "cool_up"), as the owner directed; a feed
+// without usable setting values also counts as "unknown".
 
-export const PRESENCE_AC_HEAT_BELOW_DEFAULT_ = 20;
-export const PRESENCE_AC_COOL_ABOVE_DEFAULT_ = 27;
 export const PRESENCE_TEMP_MAX_AGE_SEC_ = 30 * 60;
 
-// A numeric script property with a fallback when unset or invalid.
-export const presenceThreshold_ = (name, fallback) => {
-  const value = Number(optionalProperty_(name));
-  return isFinite(value) && optionalProperty_(name) !== '' ? value : fallback;
-};
-
 // The temperature feed body (plain JSON, or the JSONP form
-// "cb&&cb({...});") -> { temperature, timeMs }, or null when the
-// latest conditions entry cannot be read.
+// "cb&&cb({...});") -> { temperature, timeMs, heatBelow, coolAbove },
+// or null when the latest conditions entry or the setting values
+// cannot be read.
 export const parseTemperatureFeed_ = (text) => {
   if (typeof text !== 'string') return null;
   const start = text.indexOf('{');
@@ -1334,11 +1327,15 @@ export const parseTemperatureFeed_ = (text) => {
   if (!isFinite(temperature)) return null;
   const timeMs = new Date(latest.Date != null ? latest.Date : latest.date).getTime();
   if (isNaN(timeMs)) return null;
-  return { temperature, timeMs };
+  const setting = (data && data.setting) || {};
+  const heatBelow = Number(setting.hot_buttom);
+  const coolAbove = Number(setting.cool_up);
+  if (!isFinite(heatBelow) || !isFinite(coolAbove)) return null;
+  return { temperature, timeMs, heatBelow, coolAbove };
 };
 
-// The latest room temperature, or null ("unknown") when the feed is
-// unset, unreadable, or stale.
+// The latest room temperature with its thresholds, or null
+// ("unknown") when the feed is unset, unreadable, or stale.
 export const fetchTatamiTemperature_ = (now) => {
   const url = optionalProperty_('PRESENCE_TEMP_URL');
   if (!url) return null;
@@ -1354,19 +1351,21 @@ export const fetchTatamiTemperature_ = (now) => {
   if (!parsed) return null;
   const ageSec = Math.round((now.getTime() - parsed.timeMs) / 1000);
   if (ageSec < -60 || ageSec > PRESENCE_TEMP_MAX_AGE_SEC_) return null;
-  return { temperature: parsed.temperature, ageSec };
+  return {
+    temperature: parsed.temperature,
+    heatBelow: parsed.heatBelow,
+    coolAbove: parsed.coolAbove,
+    ageSec,
+  };
 };
 
-// 'heat' below the heat threshold, 'cool' above the cool threshold,
-// null in between.
-export const decideTatamiAcMode_ = (temperature) => {
+// 'heat' at or below the heat threshold, 'cool' at or above the
+// cool threshold, null in between (the sheet's start conditions).
+export const decideTatamiAcMode_ = (temperature, thresholds) => {
   if (typeof temperature !== 'number' || !isFinite(temperature)) return null;
-  if (temperature < presenceThreshold_('PRESENCE_AC_HEAT_BELOW', PRESENCE_AC_HEAT_BELOW_DEFAULT_)) {
-    return 'heat';
-  }
-  if (temperature > presenceThreshold_('PRESENCE_AC_COOL_ABOVE', PRESENCE_AC_COOL_ABOVE_DEFAULT_)) {
-    return 'cool';
-  }
+  if (!thresholds) return null;
+  if (temperature <= thresholds.heatBelow) return 'heat';
+  if (temperature >= thresholds.coolAbove) return 'cool';
   return null;
 };
 
@@ -1468,7 +1467,7 @@ export const processPresence_ = (now) => {
     if (!reading) {
       result.ac = 'temperature unknown';
     } else {
-      const mode = decideTatamiAcMode_(reading.temperature);
+      const mode = decideTatamiAcMode_(reading.temperature, reading);
       result.acTemperature = reading.temperature;
       result.acMode = mode;
       if (!mode) {

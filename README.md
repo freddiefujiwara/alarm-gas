@@ -70,13 +70,14 @@ Example:
      per line — copy the three off commands of the existing 04:50
      rule) run once. On arrival, the room temperature from
      `PRESENCE_TEMP_URL` (the air-condition status endpoint the
-     home page reads) also decides the tatami air conditioner:
-     below `PRESENCE_AC_HEAT_BELOW` (default 20) the
-     `PRESENCE_TATAMI_AC_HEAT_COMMAND` runs, above
-     `PRESENCE_AC_COOL_ABOVE` (default 27) the
-     `PRESENCE_TATAMI_AC_COOL_COMMAND` runs, and in between
-     nothing runs. A temperature reading older than 30 minutes
-     counts as unknown and nothing runs. When the properties are
+     home page reads) also decides the tatami air conditioner,
+     using the thresholds written in the sheet and carried in the
+     same feed: at or below `hot_buttom` the
+     `PRESENCE_TATAMI_AC_HEAT_COMMAND` runs, at or above
+     `cool_up` the `PRESENCE_TATAMI_AC_COOL_COMMAND` runs, and
+     in between nothing runs. A temperature reading older than
+     30 minutes, or a feed without usable setting values, counts
+     as unknown and nothing runs. When the properties are
      unset or presence-gas cannot be read, nothing fires and the
      alarms work as before. The check runs inside `myFunction`
      (every minute) and can also be bound to its own trigger as
