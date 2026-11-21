@@ -28,6 +28,22 @@
 //   DRY_RUN        "1" or "true": log command URLs instead of
 //                  calling them, so no real device is touched.
 //
+// Presence integration (reads presence-gas; all optional, and when
+// unset or unreachable nothing below changes the existing behaviour):
+//   PRESENCE_GAS_URL    The presence-gas web app URL (its /exec).
+//   PRESENCE_API_TOKEN  The presence-gas API token.
+//   PRESENCE_PERSON     Who to watch (default "freddiefujiwara").
+//   PRESENCE_SPEECH_PATH Speech command prefix for the tatami-room
+//                       speaker, ending with "/-s/". Falls back to
+//                       DEFAULT_SPEECH_PATH when unset.
+//   PRESENCE_TATAMI_OFF_COMMANDS The "tatami power off" commands run
+//                       after a home leave: a JSON array of command
+//                       strings, or one command per line. Copy the
+//                       three off commands of the existing 04:50 rule
+//                       (tatami light off, tatami air conditioner off,
+//                       circulator off). Device identifiers live only
+//                       in this property, never in this source code.
+//
 // Sheet layout (the sheet is machine-managed; there is no header row):
 //   Column A:     datetime to fire (a Date value)
 //   Columns B..K: up to 10 commands. A command is a path on the home
@@ -1068,6 +1084,282 @@ export const classify_ = (target, now) => {
   return diff < 0 ? 'cleanup' : 'keep';
 };
 
+// --- Presence integration (presence-gas reader) ---
+// Two automations watch one person's presence in the home, read from
+// the presence-gas web app (see the header comment for its script
+// properties):
+//
+//   1. Welcome-home speech: a few minutes after the person arrives
+//      home following an absence of at least 30 minutes, the tatami
+//      speaker says PRESENCE_ARRIVE_MESSAGE_ once for that arrival.
+//   2. Tatami power off: five minutes after the person leaves home
+//      (with no later arrival), the tatami off commands run once for
+//      that leave. This also covers Saturdays and other irregular
+//      departures that the weekday 04:50 rule does not.
+//
+// Common principle: when the presence properties are unset, the read
+// fails, or the data is unusable, presence reads as "unknown" and
+// nothing fires — the existing alarm behaviour is untouched. Handled
+// events are remembered in the PRESENCE_STATE script property (the
+// latest event, the one before it, and the since values already
+// notified / handled), so each event fires at most once even though
+// the check runs every minute. The absence length is derived from
+// the presence events list when presence-gas serves it, and falls
+// back to the events this script has tracked itself; an arrival
+// whose preceding absence cannot be established does not speak.
+
+export const PRESENCE_ARRIVE_MESSAGE_ = '社用携帯を所定の位置に置いてください';
+// Speak only once the arrival is at least this old, so the person is
+// actually inside (and a flapping arrival does not speak at once).
+export const PRESENCE_ARRIVE_DELAY_SEC_ = 180;
+// ... and only after an absence at least this long, so a short trip
+// out (taking the rubbish out, a quick errand) stays silent.
+export const PRESENCE_ARRIVE_MIN_ABSENCE_SEC_ = 30 * 60;
+// An arrival older than this is stale news; never speak for it.
+export const PRESENCE_ARRIVE_MAX_AGE_SEC_ = 60 * 60;
+// Run the off commands once the leave is at least this old (a later
+// arrival replaces the latest event, which cancels the off by
+// itself, because only the latest event is ever acted on).
+export const PRESENCE_LEAVE_DELAY_SEC_ = 5 * 60;
+// A leave older than this is stale news; never fire for it.
+export const PRESENCE_LEAVE_MAX_AGE_SEC_ = 2 * 60 * 60;
+
+const PRESENCE_STATE_KEY_ = 'PRESENCE_STATE';
+
+export const presencePerson_ = () => optionalProperty_('PRESENCE_PERSON') || 'freddiefujiwara';
+
+export const presenceSpeechPath_ = () =>
+  optionalProperty_('PRESENCE_SPEECH_PATH') || optionalProperty_('DEFAULT_SPEECH_PATH');
+
+// The configured tatami off commands: a JSON array of command
+// strings, or plain text with one command per line (a "|" also
+// separates). Anything else reads as no commands.
+export const parseOffCommands_ = (raw) => {
+  const text = typeof raw === 'string' ? raw.trim() : '';
+  if (!text) return [];
+  if (text.startsWith('[')) {
+    try {
+      const parsed = JSON.parse(text);
+      if (Array.isArray(parsed)) {
+        return parsed.map((c) => cellText_(c).trim()).filter((c) => c.length > 0);
+      }
+    } catch (err) {
+      // Not JSON after all: fall through to the line form.
+    }
+  }
+  return text
+    .split(/[\n|]/)
+    .map((c) => c.trim())
+    .filter((c) => c.length > 0);
+};
+
+export const tatamiOffCommands_ = () => parseOffCommands_(optionalProperty_('PRESENCE_TATAMI_OFF_COMMANDS'));
+
+// One presence-gas GET -> the parsed JSON object, or null when the
+// request fails, the status is not 200, the body is not an object,
+// or presence-gas reported an error. Never throws.
+export const fetchPresenceJson_ = (url) => {
+  try {
+    const res = UrlFetchApp.fetch(url, { muteHttpExceptions: true, method: 'get' });
+    if (res.getResponseCode() !== 200) return null;
+    const data = JSON.parse(res.getContentText());
+    if (!data || typeof data !== 'object' || data.error) return null;
+    return data;
+  } catch (err) {
+    return null;
+  }
+};
+
+export const presenceUrl_ = (base, params) => {
+  const query = Object.keys(params)
+    .map((k) => `${encodeURIComponent(k)}=${encodeURIComponent(params[k])}`)
+    .join('&');
+  return base + (base.includes('?') ? '&' : '?') + query;
+};
+
+// The person's current presence, or null ("unknown") when the
+// presence properties are unset or the answer is unusable.
+export const fetchPresence_ = () => {
+  const base = optionalProperty_('PRESENCE_GAS_URL');
+  const token = optionalProperty_('PRESENCE_API_TOKEN');
+  if (!base || !token) return null;
+  const data = fetchPresenceJson_(
+    presenceUrl_(base, { token, person: presencePerson_() })
+  );
+  if (!data || typeof data.present !== 'boolean' || !data.since) return null;
+  if (typeof data.ageSec !== 'number' || !isFinite(data.ageSec)) return null;
+  return data;
+};
+
+// The person's recorded events (ascending), or null when
+// presence-gas does not serve the list or it is unusable.
+export const fetchPresenceEvents_ = () => {
+  const base = optionalProperty_('PRESENCE_GAS_URL');
+  const token = optionalProperty_('PRESENCE_API_TOKEN');
+  if (!base || !token) return null;
+  const data = fetchPresenceJson_(
+    presenceUrl_(base, { token, person: presencePerson_(), events: '1' })
+  );
+  if (!data || !Array.isArray(data.events)) return null;
+  return data.events;
+};
+
+// How long (in seconds) the person was away before the arrival at
+// arriveSinceIso, from an ascending events list: the event right
+// before that arrival must be a leave. Null when it cannot be told.
+export const absenceSecondsFromEvents_ = (events, arriveSinceIso) => {
+  if (!Array.isArray(events) || !arriveSinceIso) return null;
+  const arriveMs = new Date(arriveSinceIso).getTime();
+  if (isNaN(arriveMs)) return null;
+  const sorted = events
+    .map((ev) => ({ ...ev, ms: new Date(ev && ev.timestamp).getTime() }))
+    .filter((ev) => !isNaN(ev.ms))
+    .sort((a, b) => a.ms - b.ms);
+  let idx = -1;
+  sorted.forEach((ev, i) => {
+    if (ev.ms <= arriveMs) idx = i;
+  });
+  if (idx < 0) return null;
+  const arrival = sorted[idx];
+  if (arrival.action !== 'arrive' || arrival.ms !== arriveMs) return null;
+  const prev = sorted[idx - 1];
+  if (!prev || prev.action !== 'leave') return null;
+  return Math.round((arriveMs - prev.ms) / 1000);
+};
+
+// The same absence length from the events this script tracked
+// itself: state.prevEvent is the distinct event seen just before
+// the current one. Null when it cannot be told.
+export const absenceSecondsFromState_ = (state, presence) => {
+  const prev = state && state.prevEvent;
+  if (!prev || prev.action !== 'leave' || !prev.since || !presence || !presence.since) {
+    return null;
+  }
+  const diffMs = new Date(presence.since).getTime() - new Date(prev.since).getTime();
+  if (isNaN(diffMs) || diffMs < 0) return null;
+  return Math.round(diffMs / 1000);
+};
+
+// Case 1: speak for this arrival? (See the section comment.)
+export const shouldNotifyArrive_ = (presence, absenceSec, notifiedSince) => {
+  if (!presence) return false;
+  if (presence.present !== true || presence.place !== 'home' || presence.action !== 'arrive') {
+    return false;
+  }
+  if (notifiedSince && notifiedSince === presence.since) return false;
+  if (presence.ageSec < PRESENCE_ARRIVE_DELAY_SEC_) return false;
+  if (presence.ageSec > PRESENCE_ARRIVE_MAX_AGE_SEC_) return false;
+  if (absenceSec == null || absenceSec < PRESENCE_ARRIVE_MIN_ABSENCE_SEC_) return false;
+  return true;
+};
+
+// Case 3: run the tatami off commands for this leave?
+export const shouldHandleLeave_ = (presence, handledSince) => {
+  if (!presence) return false;
+  if (presence.present !== false || presence.place !== 'home' || presence.action !== 'leave') {
+    return false;
+  }
+  if (handledSince && handledSince === presence.since) return false;
+  if (presence.ageSec < PRESENCE_LEAVE_DELAY_SEC_) return false;
+  if (presence.ageSec > PRESENCE_LEAVE_MAX_AGE_SEC_) return false;
+  return true;
+};
+
+export const loadPresenceState_ = () => {
+  try {
+    const raw = optionalProperty_(PRESENCE_STATE_KEY_);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch (err) {
+    return {};
+  }
+};
+
+export const savePresenceState_ = (state) => {
+  const props = PropertiesService.getScriptProperties();
+  if (typeof props.setProperty !== 'function') return;
+  props.setProperty(PRESENCE_STATE_KEY_, JSON.stringify(state));
+};
+
+// One presence check. Returns a small status object for logging and
+// tests; fires at most one speech and one off run per event. Never
+// throws: any failure reads as "unknown" and changes nothing.
+export const processPresence_ = (now) => {
+  const presence = fetchPresence_();
+  if (!presence) return { ok: false, reason: 'unknown' };
+
+  const state = loadPresenceState_();
+  // Track the latest distinct event (and the one before it) so the
+  // absence length stays known even while presence-gas has no
+  // events list.
+  const current = { action: presence.action, place: presence.place, since: presence.since };
+  if (!state.lastEvent || state.lastEvent.since !== current.since) {
+    state.prevEvent = state.lastEvent || null;
+    state.lastEvent = current;
+  }
+
+  const result = { ok: true, action: presence.action, place: presence.place, fired: [] };
+
+  if (shouldHandleLeave_(presence, state.handledLeaveSince)) {
+    const commands = tatamiOffCommands_();
+    if (commands.length === 0) {
+      // Not configured yet: leave the event unhandled so it can
+      // still fire if the commands are set within the window.
+      Logger.log('[presence] leave seen but PRESENCE_TATAMI_OFF_COMMANDS is not set');
+      result.skipped = 'off commands not configured';
+    } else {
+      fireCells_(now, commands);
+      state.handledLeaveSince = presence.since;
+      result.fired.push('tatami-off');
+    }
+  }
+
+  // The arrival checks that do not need the events list come first,
+  // so the list is only fetched for a plausible fresh arrival.
+  const arrivalPlausible =
+    presence.present === true &&
+    presence.place === 'home' &&
+    presence.action === 'arrive' &&
+    state.notifiedArriveSince !== presence.since &&
+    presence.ageSec >= PRESENCE_ARRIVE_DELAY_SEC_ &&
+    presence.ageSec <= PRESENCE_ARRIVE_MAX_AGE_SEC_;
+  if (arrivalPlausible) {
+    let absenceSec = absenceSecondsFromEvents_(
+      fetchPresenceEvents_(),
+      presence.since
+    );
+    if (absenceSec == null) {
+      absenceSec = absenceSecondsFromState_(state, presence);
+    }
+    result.absenceSec = absenceSec;
+    if (shouldNotifyArrive_(presence, absenceSec, state.notifiedArriveSince)) {
+      const speechPath = presenceSpeechPath_();
+      if (!speechPath) {
+        Logger.log('[presence] arrival seen but no speech path is set');
+        result.skipped = 'speech path not configured';
+      } else {
+        // The text is URL-encoded here: raw Japanese in the command
+        // URL is silently swallowed by the speaker (known trap).
+        const command =
+          speechPath + encodeURIComponent(speakableText_(PRESENCE_ARRIVE_MESSAGE_));
+        fireCells_(now, [command]);
+        state.notifiedArriveSince = presence.since;
+        result.fired.push('arrive-speech');
+      }
+    }
+  }
+
+  savePresenceState_(state);
+  return result;
+};
+
+// Standalone entry point for a dedicated time-driven trigger (for
+// example every 5 minutes). myFunction also runs the same check
+// every minute; the handled markers keep either path from firing
+// an event twice.
+export const checkPresence = () => processPresence_(new Date());
+
 // Runs every minute from the time-driven trigger. The function name is
 // kept from the old version so the existing trigger keeps working.
 export const myFunction = () => {
@@ -1104,4 +1396,12 @@ export const myFunction = () => {
     .forEach((rowNumber) => sheet.deleteRow(rowNumber));
 
   processRules_(now);
+
+  // Presence automations (welcome-home speech, tatami power off).
+  // A presence failure must never break the alarms above.
+  try {
+    processPresence_(now);
+  } catch (err) {
+    Logger.log('[presence] check failed: ' + (err && err.message));
+  }
 };
