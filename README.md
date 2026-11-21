@@ -57,6 +57,31 @@ Example:
      it as `sync_token` in the JSON body. It cannot touch one-shot
      alarms or share sessions and does not expire; set the same value
      in the client script's properties.
+   - Presence integration (optional, reads presence-gas): set
+     `PRESENCE_GAS_URL` (the presence-gas `/exec` URL) and
+     `PRESENCE_API_TOKEN` (its API token) to enable two automations
+     for `PRESENCE_PERSON` (default `freddiefujiwara`). A few minutes
+     after the person arrives home following an absence of at least
+     30 minutes, the tatami speaker says "社用携帯を所定の位置に
+     置いてください" once (speech prefix: `PRESENCE_SPEECH_PATH`,
+     falling back to `DEFAULT_SPEECH_PATH`). Five minutes after the
+     person leaves home, the commands in
+     `PRESENCE_TATAMI_OFF_COMMANDS` (a JSON array, or one command
+     per line — copy the three off commands of the existing 04:50
+     rule) run once. On arrival, the room temperature from
+     `PRESENCE_TEMP_URL` (the air-condition status endpoint the
+     home page reads) also decides the tatami air conditioner,
+     using the thresholds written in the sheet and carried in the
+     same feed: at or below `hot_buttom` the
+     `PRESENCE_TATAMI_AC_HEAT_COMMAND` runs, at or above
+     `cool_up` the `PRESENCE_TATAMI_AC_COOL_COMMAND` runs, and
+     in between nothing runs. A temperature reading older than
+     30 minutes, or a feed without usable setting values, counts
+     as unknown and nothing runs. When the properties are
+     unset or presence-gas cannot be read, nothing fires and the
+     alarms work as before. The check runs inside `myFunction`
+     (every minute) and can also be bound to its own trigger as
+     `checkPresence`.
    - Staging only (optional): `SPREADSHEET_ID` opens that
      spreadsheet instead of the container one, `SHEET_PREFIX`
      (e.g. `stg`) moves this copy's data into prefixed sheets of
