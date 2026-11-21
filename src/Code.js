@@ -43,6 +43,24 @@
 //                       (tatami light off, tatami air conditioner off,
 //                       circulator off). Device identifiers live only
 //                       in this property, never in this source code.
+//   PRESENCE_TEMP_URL   URL of the room-temperature feed used for
+//                       the arrival air-conditioner decision: the
+//                       air-condition status endpoint (the JSONP
+//                       export the home page reads, with a callback
+//                       parameter). Its latest conditions entry
+//                       supplies the temperature and its timestamp.
+//   PRESENCE_TATAMI_AC_HEAT_COMMAND / PRESENCE_TATAMI_AC_COOL_COMMAND
+//                       The single home-API commands that start the
+//                       tatami air conditioner on heating / cooling
+//                       (the switchbot-custom "Hot" / "Cool" commands
+//                       the alarm page already sends). Device
+//                       identifiers live only in these properties.
+//   PRESENCE_AC_HEAT_BELOW / PRESENCE_AC_COOL_ABOVE
+//                       Tatami thresholds in degrees: on arrival,
+//                       heat below the first, cool above the second,
+//                       and do nothing in between. Defaults are 20
+//                       and 27 (a starting proposal, not the living
+//                       room's air-condition settings).
 //
 // Sheet layout (the sheet is machine-managed; there is no header row):
 //   Column A:     datetime to fire (a Date value)
@@ -1085,14 +1103,18 @@ export const classify_ = (target, now) => {
 };
 
 // --- Presence integration (presence-gas reader) ---
-// Two automations watch one person's presence in the home, read from
-// the presence-gas web app (see the header comment for its script
-// properties):
+// Three automations watch one person's presence in the home, read
+// from the presence-gas web app (see the header comment for its
+// script properties):
 //
 //   1. Welcome-home speech: a few minutes after the person arrives
 //      home following an absence of at least 30 minutes, the tatami
 //      speaker says PRESENCE_ARRIVE_MESSAGE_ once for that arrival.
-//   2. Tatami power off: five minutes after the person leaves home
+//   2. Tatami air conditioner: a few minutes after the person
+//      arrives home, the room temperature decides whether the
+//      tatami air conditioner starts on heating or cooling (see
+//      the case 2 section below for the temperature source).
+//   3. Tatami power off: five minutes after the person leaves home
 //      (with no later arrival), the tatami off commands run once for
 //      that leave. This also covers Saturdays and other irregular
 //      departures that the weekday 04:50 rule does not.
@@ -1265,6 +1287,92 @@ export const shouldHandleLeave_ = (presence, handledSince) => {
   return true;
 };
 
+// --- Case 2: tatami air conditioner on arrival ---
+// A few minutes after the person arrives home, read the room
+// temperature and start the tatami air conditioner on heating when
+// it is cold, on cooling when it is hot, and not at all in between.
+// There is no tatami-specific temperature sensor in the current
+// setup: the only feed is the single SwitchBot meter whose readings
+// the home server records every 10 minutes (the same latest
+// conditions entry the home page status shows). That feed is read
+// through PRESENCE_TEMP_URL so the source can be swapped without a
+// code change. A reading older than PRESENCE_TEMP_MAX_AGE_SEC_ (or
+// an unreadable feed) counts as "unknown" and nothing runs. The
+// thresholds are tatami-specific (see the header comment); the
+// living room's air-condition settings are never consulted here.
+
+export const PRESENCE_AC_HEAT_BELOW_DEFAULT_ = 20;
+export const PRESENCE_AC_COOL_ABOVE_DEFAULT_ = 27;
+export const PRESENCE_TEMP_MAX_AGE_SEC_ = 30 * 60;
+
+// A numeric script property with a fallback when unset or invalid.
+export const presenceThreshold_ = (name, fallback) => {
+  const value = Number(optionalProperty_(name));
+  return isFinite(value) && optionalProperty_(name) !== '' ? value : fallback;
+};
+
+// The temperature feed body (plain JSON, or the JSONP form
+// "cb&&cb({...});") -> { temperature, timeMs }, or null when the
+// latest conditions entry cannot be read.
+export const parseTemperatureFeed_ = (text) => {
+  if (typeof text !== 'string') return null;
+  const start = text.indexOf('{');
+  const end = text.lastIndexOf('}');
+  if (start < 0 || end <= start) return null;
+  let data;
+  try {
+    data = JSON.parse(text.slice(start, end + 1));
+  } catch (err) {
+    return null;
+  }
+  const rows = data && data.conditions;
+  if (!Array.isArray(rows) || rows.length === 0) return null;
+  const latest = rows[rows.length - 1] || {};
+  const temperature = Number(
+    latest.Temperature != null ? latest.Temperature : latest.temperature
+  );
+  if (!isFinite(temperature)) return null;
+  const timeMs = new Date(latest.Date != null ? latest.Date : latest.date).getTime();
+  if (isNaN(timeMs)) return null;
+  return { temperature, timeMs };
+};
+
+// The latest room temperature, or null ("unknown") when the feed is
+// unset, unreadable, or stale.
+export const fetchTatamiTemperature_ = (now) => {
+  const url = optionalProperty_('PRESENCE_TEMP_URL');
+  if (!url) return null;
+  let text;
+  try {
+    const res = UrlFetchApp.fetch(url, { muteHttpExceptions: true, method: 'get' });
+    if (res.getResponseCode() !== 200) return null;
+    text = res.getContentText();
+  } catch (err) {
+    return null;
+  }
+  const parsed = parseTemperatureFeed_(text);
+  if (!parsed) return null;
+  const ageSec = Math.round((now.getTime() - parsed.timeMs) / 1000);
+  if (ageSec < -60 || ageSec > PRESENCE_TEMP_MAX_AGE_SEC_) return null;
+  return { temperature: parsed.temperature, ageSec };
+};
+
+// 'heat' below the heat threshold, 'cool' above the cool threshold,
+// null in between.
+export const decideTatamiAcMode_ = (temperature) => {
+  if (typeof temperature !== 'number' || !isFinite(temperature)) return null;
+  if (temperature < presenceThreshold_('PRESENCE_AC_HEAT_BELOW', PRESENCE_AC_HEAT_BELOW_DEFAULT_)) {
+    return 'heat';
+  }
+  if (temperature > presenceThreshold_('PRESENCE_AC_COOL_ABOVE', PRESENCE_AC_COOL_ABOVE_DEFAULT_)) {
+    return 'cool';
+  }
+  return null;
+};
+
+export const tatamiAcCommand_ = (mode) =>
+  optionalProperty_(mode === 'heat' ? 'PRESENCE_TATAMI_AC_HEAT_COMMAND' : 'PRESENCE_TATAMI_AC_COOL_COMMAND');
+
 export const loadPresenceState_ = () => {
   try {
     const raw = optionalProperty_(PRESENCE_STATE_KEY_);
@@ -1317,13 +1425,13 @@ export const processPresence_ = (now) => {
 
   // The arrival checks that do not need the events list come first,
   // so the list is only fetched for a plausible fresh arrival.
-  const arrivalPlausible =
+  const arrivalWindow =
     presence.present === true &&
     presence.place === 'home' &&
     presence.action === 'arrive' &&
-    state.notifiedArriveSince !== presence.since &&
     presence.ageSec >= PRESENCE_ARRIVE_DELAY_SEC_ &&
     presence.ageSec <= PRESENCE_ARRIVE_MAX_AGE_SEC_;
+  const arrivalPlausible = arrivalWindow && state.notifiedArriveSince !== presence.since;
   if (arrivalPlausible) {
     let absenceSec = absenceSecondsFromEvents_(
       fetchPresenceEvents_(),
@@ -1346,6 +1454,35 @@ export const processPresence_ = (now) => {
         fireCells_(now, [command]);
         state.notifiedArriveSince = presence.since;
         result.fired.push('arrive-speech');
+      }
+    }
+  }
+
+  // Case 2 (tatami air conditioner) shares the arrival window but
+  // not the absence condition, and keeps its own handled marker so
+  // the speech and the air conditioner are decided independently.
+  // An unreadable temperature leaves the arrival undecided, so a
+  // later check inside the window can still act on it.
+  if (arrivalWindow && state.acArriveSince !== presence.since) {
+    const reading = fetchTatamiTemperature_(now);
+    if (!reading) {
+      result.ac = 'temperature unknown';
+    } else {
+      const mode = decideTatamiAcMode_(reading.temperature);
+      result.acTemperature = reading.temperature;
+      result.acMode = mode;
+      if (!mode) {
+        state.acArriveSince = presence.since; // comfortable: decided
+      } else {
+        const command = tatamiAcCommand_(mode);
+        if (!command) {
+          Logger.log('[presence] arrival AC ' + mode + ' command is not set');
+          result.ac = 'ac command not configured';
+        } else {
+          fireCells_(now, [command]);
+          state.acArriveSince = presence.since;
+          result.fired.push(mode === 'heat' ? 'tatami-ac-heat' : 'tatami-ac-cool');
+        }
       }
     }
   }

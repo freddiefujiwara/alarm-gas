@@ -3,7 +3,9 @@ import {
   PRESENCE_ARRIVE_MESSAGE_,
   absenceSecondsFromEvents_,
   absenceSecondsFromState_,
+  decideTatamiAcMode_,
   parseOffCommands_,
+  parseTemperatureFeed_,
   processPresence_,
   shouldHandleLeave_,
   shouldNotifyArrive_,
@@ -15,6 +17,8 @@ let fired;
 let presenceResponse;
 let eventsResponse;
 let presenceStatus;
+let tempResponse;
+let tempStatus;
 
 const BASE_PROPS = {
   API_BASE_URL: "http://home-api.example",
@@ -48,6 +52,12 @@ global.UrlFetchApp = {
       return {
         getResponseCode: () => presenceStatus,
         getContentText: () => JSON.stringify(payload),
+      };
+    }
+    if (u.startsWith("https://temp.example/")) {
+      return {
+        getResponseCode: () => tempStatus,
+        getContentText: () => tempResponse,
       };
     }
     fired.push(u);
@@ -109,9 +119,18 @@ const leavePresence = (ageSec, since = T_LEAVE) => ({
   ageSec,
 });
 
+const tempFeed = (temperature, date = "11/22/2026 12:40:00 AM") =>
+  `cb&&cb(${JSON.stringify({
+    conditions: [{ Date: date, Temperature: temperature, Humid: 40 }],
+    status: "off",
+    setting: {},
+  })});`;
+
 beforeEach(() => {
   props = { ...BASE_PROPS };
   fired = [];
+  tempStatus = 200;
+  tempResponse = tempFeed(24);
   presenceStatus = 200;
   presenceResponse = arrivePresence(200);
   eventsResponse = {
@@ -280,5 +299,109 @@ describe("processPresence_", () => {
     expect(result.skipped).toBe("off commands not configured");
     const state = JSON.parse(props.PRESENCE_STATE);
     expect(state.handledLeaveSince).toBeUndefined();
+  });
+});
+
+describe("parseTemperatureFeed_", () => {
+  it("reads the latest entry of the JSONP feed", () => {
+    const parsed = parseTemperatureFeed_(tempFeed(25.3));
+    expect(parsed.temperature).toBe(25.3);
+    expect(parsed.timeMs).toBe(new Date("11/22/2026 12:40:00 AM").getTime());
+  });
+  it("reads plain JSON too", () => {
+    const parsed = parseTemperatureFeed_(
+      JSON.stringify({ conditions: [{ Date: "11/22/2026 12:40:00 AM", Temperature: 19 }] })
+    );
+    expect(parsed.temperature).toBe(19);
+  });
+  it("is null for unusable bodies", () => {
+    expect(parseTemperatureFeed_("not json")).toBeNull();
+    expect(parseTemperatureFeed_(JSON.stringify({ conditions: [] }))).toBeNull();
+    expect(
+      parseTemperatureFeed_(
+        JSON.stringify({ conditions: [{ Date: "11/22/2026 12:40:00 AM", Temperature: "hot" }] })
+      )
+    ).toBeNull();
+    expect(parseTemperatureFeed_(null)).toBeNull();
+  });
+});
+
+describe("decideTatamiAcMode_", () => {
+  it("heats below 20, cools above 27, and rests in between by default", () => {
+    expect(decideTatamiAcMode_(19.9)).toBe("heat");
+    expect(decideTatamiAcMode_(20)).toBeNull();
+    expect(decideTatamiAcMode_(24)).toBeNull();
+    expect(decideTatamiAcMode_(27)).toBeNull();
+    expect(decideTatamiAcMode_(27.1)).toBe("cool");
+    expect(decideTatamiAcMode_(NaN)).toBeNull();
+  });
+  it("honours threshold properties over the defaults", () => {
+    props.PRESENCE_AC_HEAT_BELOW = "22";
+    props.PRESENCE_AC_COOL_ABOVE = "26";
+    expect(decideTatamiAcMode_(21)).toBe("heat");
+    expect(decideTatamiAcMode_(26.5)).toBe("cool");
+  });
+});
+
+describe("processPresence_ tatami air conditioner (case 2)", () => {
+  const now = new Date("2026-11-22T00:43:20.000Z");
+  const enableAc = () => {
+    props.PRESENCE_TEMP_URL = "https://temp.example/exec?callback=cb";
+    props.PRESENCE_TATAMI_AC_HEAT_COMMAND = "switchbot-custom -d TESTDEVICE -c Hot";
+    props.PRESENCE_TATAMI_AC_COOL_COMMAND = "switchbot-custom -d TESTDEVICE -c Cool";
+    // Keep the speech out of these cases: a short absence stays silent.
+    eventsResponse = {
+      events: [
+        { timestamp: "2026-11-22T00:30:00.000Z", person: "freddiefujiwara", place: "home", action: "leave" },
+        { timestamp: T_ARRIVE, person: "freddiefujiwara", place: "home", action: "arrive" },
+      ],
+    };
+  };
+
+  it("starts heating once when the room is cold on arrival", () => {
+    enableAc();
+    tempResponse = tempFeed(18);
+    const result = processPresence_(now);
+    expect(result.fired).toEqual(["tatami-ac-heat"]);
+    expect(fired).toEqual(["http://home-api.example/switchbot-custom/-d/TESTDEVICE/-c/Hot"]);
+    expect(processPresence_(now).fired).toEqual([]);
+    expect(fired).toHaveLength(1);
+  });
+
+  it("starts cooling when the room is hot on arrival", () => {
+    enableAc();
+    tempResponse = tempFeed(29.5);
+    expect(processPresence_(now).fired).toEqual(["tatami-ac-cool"]);
+    expect(fired).toEqual(["http://home-api.example/switchbot-custom/-d/TESTDEVICE/-c/Cool"]);
+  });
+
+  it("decides to do nothing at a comfortable temperature", () => {
+    enableAc();
+    tempResponse = tempFeed(24);
+    const result = processPresence_(now);
+    expect(result.fired).toEqual([]);
+    expect(result.acMode).toBeNull();
+    const state = JSON.parse(props.PRESENCE_STATE);
+    expect(state.acArriveSince).toBe(T_ARRIVE);
+  });
+
+  it("does nothing for a stale temperature and stays undecided", () => {
+    enableAc();
+    tempResponse = tempFeed(18, "11/21/2026 10:40:00 PM");
+    const result = processPresence_(now);
+    expect(result.fired).toEqual([]);
+    expect(result.ac).toBe("temperature unknown");
+    const state = JSON.parse(props.PRESENCE_STATE);
+    expect(state.acArriveSince).toBeUndefined();
+  });
+
+  it("does nothing when the temperature feed is not configured", () => {
+    tempResponse = tempFeed(18);
+    const result = processPresence_(now);
+    // Only the welcome-home speech fires (the default events show a
+    // long absence); no air-conditioner command runs.
+    expect(result.fired).toEqual(["arrive-speech"]);
+    expect(result.ac).toBe("temperature unknown");
+    expect(fired).toHaveLength(1);
   });
 });
