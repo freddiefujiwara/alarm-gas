@@ -82,6 +82,22 @@ Example:
      alarms work as before. The check runs inside `myFunction`
      (every minute) and can also be bound to its own trigger as
      `checkPresence`.
+   - Homecoming announcement (optional, reads presence-gas and
+     calendar-gas): set `CALENDAR_GAS_URL` (the calendar-gas
+     `/exec` URL) and `CALENDAR_API_TOKEN` to let the presence
+     check also judge whether the person is heading home from
+     work. A work leave at/after 16:30 JST on a day with a work
+     arrival becomes a candidate; 20 minutes later, if the person
+     is still away, the calendar digest decides the announcement
+     time (daytime commitments hold it until they end, an evening
+     plan shifts it to the plan's end + 30 minutes, and a time
+     at/after 22:30 JST cancels it). The living-room speaker then
+     says "パパがもうすぐ帰ってきます" once per day, through the
+     command prefix in `HOMECOMING_SPEECH_PATH`. With
+     `HOMECOMING_DRY_RUN` (`1` or `true`) the judgement runs in
+     full and records each step in the presence state's history,
+     but nothing is ever spoken — the observation mode. When the
+     calendar cannot be read, nothing is announced.
    - Staging only (optional): `SPREADSHEET_ID` opens that
      spreadsheet instead of the container one, `SHEET_PREFIX`
      (e.g. `stg`) moves this copy's data into prefixed sheets of
