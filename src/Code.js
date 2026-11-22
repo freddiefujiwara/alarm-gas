@@ -60,6 +60,18 @@
 //                       the alarm page already sends). Device
 //                       identifiers live only in these properties.
 //
+// Homecoming announcement (reads presence-gas and calendar-gas; all
+// optional, and when unset or unreachable nothing is announced):
+//   CALENDAR_GAS_URL    The calendar-gas web app URL (its /exec).
+//   CALENDAR_API_TOKEN  The calendar-gas API token.
+//   HOMECOMING_SPEECH_PATH Speech command prefix for the living-room
+//                       (Nest) speaker, ending with "/-s/". Used only
+//                       when the announcement actually fires.
+//   HOMECOMING_DRY_RUN  "1" or "true": run the whole judgement and
+//                       record what would have been announced in the
+//                       PRESENCE_STATE history, but never speak. The
+//                       observation phase runs with this set.
+//
 // Sheet layout (the sheet is machine-managed; there is no header row):
 //   Column A:     datetime to fire (a Date value)
 //   Columns B..K: up to 10 commands. A command is a path on the home
@@ -1486,7 +1498,264 @@ export const processPresence_ = (now) => {
     }
   }
 
+  // Homecoming announcement judgement (see the section below). It
+  // shares this check's presence read and state, and keeps its own
+  // sub-state; a failure here must not disturb the cases above.
+  try {
+    result.homecoming = processHomecoming_(now, presence, state);
+  } catch (err) {
+    Logger.log('[homecoming] check failed: ' + (err && err.message));
+  }
+
   savePresenceState_(state);
+  return result;
+};
+
+// --- Homecoming announcement ---
+// When the person leaves work in the evening and is really heading
+// home, the living-room (Nest) speaker tells the family once:
+// "パパがもうすぐ帰ってきます". The hard part is telling a real
+// departure from the frequent daytime walks (temporary leaves from
+// work), so the judgement is staged:
+//
+//   - Only a work leave at/after the evening gate (16:30 JST) on a
+//     day the person was seen arriving at work becomes a candidate.
+//   - The candidate matures 20 minutes later; if the latest event
+//     has moved on by then (back at work = it was a walk, arrived
+//     home = no need), the candidate is cancelled instead.
+//   - At maturation the calendar digest (calendar-gas) is read once:
+//     daytime commitments running past the leave hold the
+//     announcement until they end; an evening plan shifts it to
+//     the plan's end + 30 minutes; a shifted time past the 22:30
+//     JST cutoff cancels it for the day.
+//   - At most one announcement per day. Any unreadable input
+//     (presence or calendar) counts as "unknown" and nothing fires.
+//
+// The family-at-home check from the original design is deliberately
+// absent: the wife's presence is not recorded anywhere, so it cannot
+// be judged (the owner decided this). When nobody is home the
+// announcement simply plays to an empty room.
+//
+// Observation phase: with HOMECOMING_DRY_RUN set, the judgement runs
+// in full and every step (candidate, digest, would-be announcement,
+// cancellation) is appended to a bounded history in the presence
+// state and logged, but nothing is ever spoken. Decisions live in
+// state.homecoming: { lastWorkArriveSince, candidate, announcedDate,
+// observedLeaveSince, history }.
+
+export const HOMECOMING_MESSAGE_ = 'パパがもうすぐ帰ってきます';
+// Evening gate in JST minutes of day: a work leave earlier than
+// this is daytime behaviour (walks, errands), never a candidate.
+export const HOMECOMING_GATE_MINUTES_ = 16 * 60 + 30;
+// A candidate matures this long after the leave: walks are back by
+// then, a real commute is still on the way.
+export const HOMECOMING_CONFIRM_SEC_ = 20 * 60;
+// After an evening plan ends, wait this long before announcing.
+export const HOMECOMING_NIGHT_BUFFER_SEC_ = 30 * 60;
+// Never announce at/after this JST time (the family is asleep).
+export const HOMECOMING_CUTOFF_MINUTES_ = 22 * 60 + 30;
+// A candidate older than this is stale news; drop it silently.
+export const HOMECOMING_MAX_CANDIDATE_AGE_SEC_ = 3 * 60 * 60;
+// Observation history covers long work leaves from this JST time.
+export const HOMECOMING_OBSERVE_FROM_MINUTES_ = 15 * 60;
+const HOMECOMING_HISTORY_MAX_ = 40;
+
+export const homecomingDryRun_ = () => {
+  const value = optionalProperty_('HOMECOMING_DRY_RUN').toLowerCase();
+  return value === '1' || value === 'true';
+};
+
+// JST wall-clock parts of a Date. Asia/Tokyo is UTC+9 year-round,
+// so this is exact in any runtime timezone (tests included).
+export const jstParts_ = (date) => {
+  const t = new Date(date.getTime() + 9 * 60 * 60 * 1000);
+  const pad = (n) => String(n).padStart(2, '0');
+  return {
+    date: `${t.getUTCFullYear()}-${pad(t.getUTCMonth() + 1)}-${pad(t.getUTCDate())}`,
+    minutes: t.getUTCHours() * 60 + t.getUTCMinutes(),
+  };
+};
+
+// The epoch ms of a JST wall-clock time (minutes into the JST date).
+export const jstTimeMs_ = (dateStr, minutes) => {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  return Date.UTC(y, m - 1, d, 0, minutes - 9 * 60, 0, 0);
+};
+
+// The calendar digest for one date, or null ("unknown") when the
+// calendar properties are unset, the read fails, or the answer is
+// unusable. The digest carries no titles, only booleans and times.
+export const fetchCalendarDigest_ = (dateStr) => {
+  const base = optionalProperty_('CALENDAR_GAS_URL');
+  const token = optionalProperty_('CALENDAR_API_TOKEN');
+  if (!base || !token) return null;
+  const data = fetchPresenceJson_(presenceUrl_(base, { token, date: dateStr }));
+  if (!data || data.ok !== true || typeof data.hasNightPlan !== 'boolean') return null;
+  return data;
+};
+
+// When to announce for a work leave, as epoch ms, from the digest.
+// Null means never for this leave (a night plan ending so late that
+// even the shifted time passes the cutoff).
+export const homecomingAnnounceMs_ = (leaveMs, dateStr, digest) => {
+  let ms = leaveMs + HOMECOMING_CONFIRM_SEC_ * 1000;
+  const workEndMs = digest.lastWorkEventEnd
+    ? new Date(digest.lastWorkEventEnd).getTime()
+    : NaN;
+  if (!isNaN(workEndMs) && workEndMs > ms) ms = workEndMs;
+  if (digest.hasNightPlan) {
+    const nightEndMs = digest.nightPlanEnd
+      ? new Date(digest.nightPlanEnd).getTime()
+      : NaN;
+    if (isNaN(nightEndMs)) return null;
+    ms = Math.max(ms, nightEndMs + HOMECOMING_NIGHT_BUFFER_SEC_ * 1000);
+  }
+  if (ms >= jstTimeMs_(dateStr, HOMECOMING_CUTOFF_MINUTES_)) return null;
+  return ms;
+};
+
+// One homecoming judgement inside the presence check. Mutates
+// state.homecoming; the caller saves the state. Never throws.
+export const processHomecoming_ = (now, presence, state) => {
+  const result = { announced: false };
+  if (!presence || !presence.since) return result;
+  const sinceMs = new Date(presence.since).getTime();
+  if (isNaN(sinceMs)) return result;
+
+  const hc =
+    state.homecoming && typeof state.homecoming === 'object'
+      ? state.homecoming
+      : {};
+  state.homecoming = hc;
+  if (!Array.isArray(hc.history)) hc.history = [];
+  const record = (entry) => {
+    hc.history.push(entry);
+    while (hc.history.length > HOMECOMING_HISTORY_MAX_) hc.history.shift();
+    Logger.log('[homecoming] ' + JSON.stringify(entry));
+  };
+
+  const parts = jstParts_(new Date(sinceMs));
+  const isWorkLeave =
+    presence.place === 'work' && presence.action === 'leave' && presence.present === false;
+
+  if (presence.place === 'work' && presence.action === 'arrive') {
+    hc.lastWorkArriveSince = presence.since;
+  }
+
+  // The latest event moved on: an open candidate is cancelled (a
+  // work arrival means it was a walk; anything else ends the trip
+  // this candidate was about).
+  if (hc.candidate && !(isWorkLeave && hc.candidate.leaveSince === presence.since)) {
+    record({
+      type: 'cancelled',
+      leaveSince: hc.candidate.leaveSince,
+      reason: `${presence.place}/${presence.action}`,
+      at: now.toISOString(),
+    });
+    hc.candidate = null;
+  }
+
+  if (!isWorkLeave) return result;
+
+  // Observation: one history entry per long work leave in the
+  // evening hours, candidate or not, so the gate can be tuned from
+  // real data after the fact.
+  if (
+    presence.ageSec >= HOMECOMING_CONFIRM_SEC_ &&
+    parts.minutes >= HOMECOMING_OBSERVE_FROM_MINUTES_ &&
+    hc.observedLeaveSince !== presence.since
+  ) {
+    hc.observedLeaveSince = presence.since;
+    record({
+      type: 'leave-observed',
+      leaveSince: presence.since,
+      gatePassed: parts.minutes >= HOMECOMING_GATE_MINUTES_,
+      at: now.toISOString(),
+    });
+  }
+
+  if (!hc.candidate && hc.announcedDate !== parts.date) {
+    const arrivedToday =
+      !!hc.lastWorkArriveSince &&
+      jstParts_(new Date(hc.lastWorkArriveSince)).date === parts.date;
+    if (arrivedToday && parts.minutes >= HOMECOMING_GATE_MINUTES_) {
+      hc.candidate = { leaveSince: presence.since, leaveMs: sinceMs, date: parts.date };
+      record({ type: 'candidate', leaveSince: presence.since, at: now.toISOString() });
+    }
+  }
+  if (!hc.candidate) return result;
+  const candidate = hc.candidate;
+
+  // A candidate with a decided announcement time lives until that
+  // time (plus a grace for the every-minute check to land); one
+  // still waiting for its digest expires after the maximum age.
+  const deadline =
+    candidate.announceMs != null
+      ? candidate.announceMs + HOMECOMING_CONFIRM_SEC_ * 1000
+      : candidate.leaveMs + HOMECOMING_MAX_CANDIDATE_AGE_SEC_ * 1000;
+  if (now.getTime() > deadline) {
+    record({ type: 'expired', leaveSince: candidate.leaveSince, at: now.toISOString() });
+    hc.candidate = null;
+    return result;
+  }
+
+  // Read the digest once, when the candidate matures, so the answer
+  // reflects the calendar as it stands then. An unreadable digest
+  // just waits for the next check.
+  if (!candidate.digestChecked) {
+    if (now.getTime() - candidate.leaveMs < HOMECOMING_CONFIRM_SEC_ * 1000) {
+      return result;
+    }
+    const digest = fetchCalendarDigest_(candidate.date);
+    if (!digest) {
+      result.waiting = 'calendar unknown';
+      return result;
+    }
+    candidate.digestChecked = true;
+    candidate.hasNightPlan = digest.hasNightPlan;
+    candidate.announceMs = homecomingAnnounceMs_(candidate.leaveMs, candidate.date, digest);
+    record({
+      type: 'digest',
+      leaveSince: candidate.leaveSince,
+      hasNightPlan: digest.hasNightPlan,
+      nightPlanEnd: digest.nightPlanEnd || null,
+      lastWorkEventEnd: digest.lastWorkEventEnd || null,
+      announceMs: candidate.announceMs,
+      at: now.toISOString(),
+    });
+    if (candidate.announceMs == null) {
+      hc.candidate = null;
+      return result;
+    }
+  }
+
+  if (now.getTime() < candidate.announceMs) return result;
+
+  const dryRun = homecomingDryRun_();
+  if (!dryRun) {
+    const speechPath = optionalProperty_('HOMECOMING_SPEECH_PATH');
+    if (!speechPath) {
+      // Not configured yet: stay undecided so setting the path
+      // within the candidate window can still announce.
+      Logger.log('[homecoming] announcement due but HOMECOMING_SPEECH_PATH is not set');
+      result.skipped = 'speech path not configured';
+      return result;
+    }
+    const command =
+      speechPath + encodeURIComponent(speakableText_(HOMECOMING_MESSAGE_));
+    fireCells_(now, [command]);
+  }
+  record({
+    type: 'announce',
+    leaveSince: candidate.leaveSince,
+    hasNightPlan: !!candidate.hasNightPlan,
+    dryRun,
+    at: now.toISOString(),
+  });
+  hc.announcedDate = candidate.date;
+  hc.candidate = null;
+  result.announced = true;
+  result.dryRun = dryRun;
   return result;
 };
 
