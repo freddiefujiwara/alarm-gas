@@ -132,3 +132,11 @@ The token is verified and its email must be listed in the
 `AVAILABLE_GMAILS` script property (`GOOGLE_OAUTH_CLIENT_ID` is the
 expected audience). Actions: `list`, `set`, `delete`. The anonymous
 `doGet` above stays as it is for the existing home page.
+
+Recurring rules (`list_rules` / `set_rule` / `delete_rule`) accept an
+optional `exceptions` list of dates (`YYYY-MM-DD` or `YYYYMMDD`): a
+rule does not fire on those dates. The `set_rule_exceptions` action
+(`{ id, exceptions }`) replaces one rule's exception dates in place
+without recreating the rule. Exception dates are stored in the rules
+sheet's `exceptions` column (comma-separated `YYYYMMDD`); sheets laid
+out before that column existed are migrated in place on first use.

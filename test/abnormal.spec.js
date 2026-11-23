@@ -31,6 +31,9 @@ const dataSheet = (get, onAppend) => ({
   getDataRange: vi.fn(() => ({ getValues: vi.fn(get) })),
   appendRow: vi.fn((row) => onAppend(row)),
   deleteRow: vi.fn((n) => get().splice(n - 1, 1)),
+  insertColumnBefore: vi.fn((col) => {
+    get().forEach((row) => row.splice(col - 1, 0, ""));
+  }),
   getRange: vi.fn((row, col) => ({
     clearContent: vi.fn(),
     setValues: vi.fn(),
@@ -134,7 +137,7 @@ global.PropertiesService = {
 beforeEach(() => {
   sheetValues = [];
   appended = [];
-  rulesValues = [["id", "time", "weekdays", "until", "last_fired", "commands"]];
+  rulesValues = [["id", "time", "weekdays", "until", "last_fired", "exceptions", "commands"]];
   shareValues = [
     ["token_hash", "issued_at", "expires_at", "revoked_at", "access_count", "last_accessed_at"],
   ];
@@ -250,24 +253,25 @@ describe("speech command encoding", () => {
 
 describe("rowToRule_ with deformed rows", () => {
   it("drops an unstringifiable command cell instead of throwing", () => {
-    const rule = rowToRule_(["r1", "07:30", "1", "", "", unstringifiable, "/a"]);
+    const rule = rowToRule_(["r1", "07:30", "1", "", "", "", unstringifiable, "/a"]);
     expect(rule).not.toBeNull();
     expect(rule.commands).toEqual(["/a"]);
   });
 
   it("reads a row with an unstringifiable id or weekdays as unreadable", () => {
-    expect(rowToRule_([unstringifiable, "07:30", "1", "", "", "/a"])).toBeNull();
-    expect(rowToRule_(["r1", "07:30", unstringifiable, "", "", "/a"])).toBeNull();
+    expect(rowToRule_([unstringifiable, "07:30", "1", "", "", "", "/a"])).toBeNull();
+    expect(rowToRule_(["r1", "07:30", unstringifiable, "", "", "", "/a"])).toBeNull();
   });
 
   it("keeps a well-formed row byte-identical in shape", () => {
-    expect(rowToRule_(["r1", "07:30", "1,5", "20261231", "202611020730", "/a"])).toEqual({
+    expect(rowToRule_(["r1", "07:30", "1,5", "20261231", "202611020730", "20261225", "/a"])).toEqual({
       id: "r1",
       hour: 7,
       minute: 30,
       weekdays: [1, 5],
       until: "20261231",
       lastFired: "202611020730",
+      exceptions: ["20261225"],
       commands: ["/a"],
     });
   });
@@ -298,14 +302,14 @@ describe("doPost rules with deformed bodies", () => {
   it("does not delete a rule when the id is an array wrapping its id", () => {
     // String([123]) used to become "123" and delete the rule whose
     // stored id is the number 123 (the bucket-list-gas wrong-delete).
-    rulesValues.push([123, "07:00", "1", "", "", "/a"]);
+    rulesValues.push([123, "07:00", "1", "", "", "", "/a"]);
     post({ ...sync, action: "delete_rule", id: [123] });
     expect(resultJson()).toMatchObject({ ok: false });
     expect(rulesValues).toHaveLength(2);
   });
 
   it("still deletes by a numeric id (Sheets stores bare ids as numbers)", () => {
-    rulesValues.push([123, "07:00", "1", "", "", "/a"]);
+    rulesValues.push([123, "07:00", "1", "", "", "", "/a"]);
     post({ ...sync, action: "delete_rule", id: 123 });
     expect(resultJson()).toMatchObject({ ok: true, deleted: 1 });
     expect(rulesValues).toHaveLength(1);
@@ -343,8 +347,8 @@ describe("doPost rules with deformed bodies", () => {
   });
 
   it("lists the good rules when one stored row is deformed", () => {
-    rulesValues.push(["bad", "07:30", "1", "", "", unstringifiable]);
-    rulesValues.push(["good", "08:00", "1", "", "", "/a"]);
+    rulesValues.push(["bad", "07:30", "1", "", "", "", unstringifiable]);
+    rulesValues.push(["good", "08:00", "1", "", "", "", "/a"]);
     post({ ...auth, action: "list_rules" });
     expect(resultJson().ok).toBe(true);
     expect(resultJson().rules.map((r) => r.id)).toEqual(["bad", "good"]);
