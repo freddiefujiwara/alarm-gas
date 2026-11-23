@@ -820,6 +820,68 @@ describe("doPost rules", () => {
     expect(rulesValues[1][5]).toBe("");
   });
 
+  it("updates a rule in place with update_rule and keeps omitted fields", () => {
+    post({
+      ...auth, action: "set_rule", time: "07:00", weekdays: [1, 2, 3],
+      until: "20261231", exceptions: ["2026-12-25"], commands: ["/a", "/b"],
+    });
+    const id = resultJson().rule.id;
+    post({ ...auth, action: "update_rule", id, time: "08:15" });
+    const res = resultJson();
+    expect(res.ok).toBe(true);
+    expect(res.rule.id).toBe(id);
+    expect(res.rule.time).toBe("08:15");
+    expect(res.rule.weekdays).toEqual([1, 2, 3]);
+    expect(res.rule.until).toBe("20261231");
+    expect(res.rule.exceptions).toEqual(["20261225"]);
+    expect(res.rule.commands).toEqual(["/a", "/b"]);
+    expect(rulesValues[1][1]).toBe("08:15");
+  });
+
+  it("update_rule resets last_fired only when the time changes", () => {
+    rulesValues.push(["r1", "07:00", "0,1,2,3,4,5,6", "", "202611020700", "", "/a"]);
+    post({ ...auth, action: "update_rule", id: "r1", exceptions: ["2026-12-25"] });
+    expect(resultJson().ok).toBe(true);
+    expect(rulesValues[1][4]).toBe("202611020700");
+    post({ ...auth, action: "update_rule", id: "r1", time: "07:30" });
+    expect(resultJson().ok).toBe(true);
+    expect(rulesValues[1][4]).toBe("");
+  });
+
+  it("update_rule rewrites commands and clears leftover cells", () => {
+    rulesValues.push(["r1", "07:00", "0,1,2,3,4,5,6", "", "", "", "/a", "/b", "/c"]);
+    post({ ...auth, action: "update_rule", id: "r1", commands: ["/x"] });
+    expect(resultJson().ok).toBe(true);
+    expect(resultJson().rule.commands).toEqual(["/x"]);
+    expect(rulesValues[1].slice(6)).toEqual(["/x", "", ""]);
+  });
+
+  it("update_rule can clear until and exceptions with empty values", () => {
+    rulesValues.push(["r1", "07:00", "0,1,2,3,4,5,6", "20261231", "", "20261225", "/a"]);
+    post({ ...auth, action: "update_rule", id: "r1", until: "", exceptions: [] });
+    expect(resultJson().ok).toBe(true);
+    expect(resultJson().rule.until).toBe(null);
+    expect(resultJson().rule.exceptions).toEqual([]);
+    expect(rulesValues[1][3]).toBe("");
+    expect(rulesValues[1][5]).toBe("");
+  });
+
+  it("update_rule rejects unknown ids, missing ids and invalid fields", () => {
+    post({ ...auth, action: "update_rule", id: "nope", time: "08:00" });
+    expect(resultJson().ok).toBe(false);
+    expect(resultJson().error).toBe("rule not found");
+    post({ ...auth, action: "update_rule", time: "08:00" });
+    expect(resultJson().ok).toBe(false);
+    rulesValues.push(["r1", "07:00", "0,1,2,3,4,5,6", "", "", "", "/a"]);
+    post({ ...auth, action: "update_rule", id: "r1", time: "25:00" });
+    expect(resultJson().ok).toBe(false);
+    post({ ...auth, action: "update_rule", id: "r1", until: "20200101" });
+    expect(resultJson().ok).toBe(false);
+    post({ ...auth, action: "update_rule", id: "r1", commands: [] });
+    expect(resultJson().ok).toBe(false);
+    expect(rulesValues[1][1]).toBe("07:00");
+  });
+
   it("enforces the rule limit", () => {
     for (let i = 0; i < 256; i += 1) {
       rulesValues.push([`id-${i}`, "07:00", "0,1,2,3,4,5,6", "", "", "", "/a"]);
@@ -865,6 +927,9 @@ describe("doPost sync token", () => {
     post({ ...sync, action: "issue_share" });
     expect(resultJson().ok).toBe(false);
     post({ ...sync, action: "set_rule_exceptions", id: "x", exceptions: [] });
+    expect(resultJson().ok).toBe(false);
+    expect(resultJson().status).toBe(403);
+    post({ ...sync, action: "update_rule", id: "x", time: "08:00" });
     expect(resultJson().ok).toBe(false);
     expect(resultJson().status).toBe(403);
   });

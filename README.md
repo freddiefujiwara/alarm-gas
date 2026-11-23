@@ -140,3 +140,7 @@ rule does not fire on those dates. The `set_rule_exceptions` action
 without recreating the rule. Exception dates are stored in the rules
 sheet's `exceptions` column (comma-separated `YYYYMMDD`); sheets laid
 out before that column existed are migrated in place on first use.
+The `update_rule` action (`{ id, ... }`) rewrites one rule in place:
+any of `time`, `weekdays` / `exclude_weekdays`, `until`, `exceptions`
+and `commands` / `text` may be given, omitted fields keep their
+values, and `last_fired` is reset only when the time of day changes.
