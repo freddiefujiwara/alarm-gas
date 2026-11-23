@@ -47,6 +47,9 @@ const dataSheet = (get, onAppend) => ({
   getDataRange: vi.fn(() => ({ getValues: vi.fn(get) })),
   appendRow: vi.fn((row) => onAppend(row)),
   deleteRow: vi.fn((n) => get().splice(n - 1, 1)),
+  insertColumnBefore: vi.fn((col) => {
+    get().forEach((row) => row.splice(col - 1, 0, ""));
+  }),
   getRange: vi.fn((row, col) => ({
     clearContent: vi.fn(),
     setValues: vi.fn(),
@@ -147,7 +150,7 @@ global.PropertiesService = {
 
 beforeEach(() => {
   sheetValues = [];
-  rulesValues = [["id", "time", "weekdays", "until", "last_fired", "commands"]];
+  rulesValues = [["id", "time", "weekdays", "until", "last_fired", "exceptions", "commands"]];
   shareValues = [
     ["token_hash", "issued_at", "expires_at", "revoked_at", "access_count", "last_accessed_at"],
   ];
@@ -352,6 +355,17 @@ describe("rule row round-trip", () => {
                   ).padStart(2, "0")}`
               )
           ),
+          exceptions: fc.uniqueArray(
+            fc
+              .date({ min: new Date(2000, 0, 1), max: new Date(2099, 11, 31), noInvalidDate: true })
+              .map(
+                (d) =>
+                  `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, "0")}${String(
+                    d.getDate()
+                  ).padStart(2, "0")}`
+              ),
+            { maxLength: 3 }
+          ),
           commands: fc.array(
             fc.string({ minLength: 1, maxLength: 10 }).filter((s) => s.trim() === s),
             { maxLength: 3 }
@@ -359,12 +373,14 @@ describe("rule row round-trip", () => {
         }),
         (rule) => {
           const sorted = [...rule.weekdays].sort((a, b) => a - b);
+          const sortedExceptions = [...rule.exceptions].sort();
           const row = [
             rule.id,
             formatTimeOfDay_(rule.hour, rule.minute),
             sorted.join(","),
             rule.until,
             "",
+            sortedExceptions.join(","),
             ...rule.commands,
           ];
           expect(rowToRule_(row)).toEqual({
@@ -374,6 +390,7 @@ describe("rule row round-trip", () => {
             weekdays: sorted,
             until: rule.until,
             lastFired: "",
+            exceptions: sortedExceptions,
             commands: rule.commands,
           });
           expect(serializeRule_(rowToRule_(row)).time).toBe(

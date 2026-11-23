@@ -10,6 +10,8 @@ import {
   isDryRun_,
   myFunction,
   parseDateKey_,
+  parseExceptionDates_,
+  parseExceptionsInput_,
   parseTarget_,
   parseTimeOfDay_,
   parseWeekdays_,
@@ -71,6 +73,9 @@ const mockRulesSheet = {
   getDataRange: vi.fn(() => ({ getValues: vi.fn(() => rulesValues) })),
   appendRow: vi.fn((row) => rulesValues.push([...row])),
   deleteRow: vi.fn((n) => rulesValues.splice(n - 1, 1)),
+  insertColumnBefore: vi.fn((col) => {
+    rulesValues.forEach((row) => row.splice(col - 1, 0, ""));
+  }),
   getRange: vi.fn((row, col) => ({
     setValue: vi.fn((value) => {
       rulesValues[row - 1][col - 1] = value;
@@ -194,7 +199,7 @@ beforeEach(() => {
     ["token_hash", "issued_at", "expires_at", "revoked_at", "access_count", "last_accessed_at"],
   ];
   rulesSheetExists = true;
-  rulesValues = [["id", "time", "weekdays", "until", "last_fired", "commands"]];
+  rulesValues = [["id", "time", "weekdays", "until", "last_fired", "exceptions", "commands"]];
   tokenInfo = {
     code: 200,
     payload: {
@@ -697,6 +702,25 @@ describe("rule parsing helpers", () => {
   });
 });
 
+describe("exception date parsing", () => {
+  it("reads stored cells leniently, dropping entries that are not dates", () => {
+    expect(parseExceptionDates_("")).toEqual([]);
+    expect(parseExceptionDates_(null)).toEqual([]);
+    expect(parseExceptionDates_("20270101,20261225")).toEqual(["20261225", "20270101"]);
+    expect(parseExceptionDates_("20261225,not-a-date,20261225")).toEqual(["20261225"]);
+    expect(parseExceptionDates_(new Date(2026, 11, 25))).toEqual(["20261225"]);
+    expect(parseExceptionDates_(20261225)).toEqual(["20261225"]);
+  });
+
+  it("validates API input strictly", () => {
+    expect(parseExceptionsInput_(undefined)).toEqual([]);
+    expect(parseExceptionsInput_(["2027-01-01", "20261225"])).toEqual(["20261225", "20270101"]);
+    expect(parseExceptionsInput_("2026-12-25")).toEqual(["20261225"]);
+    expect(parseExceptionsInput_(["2026-02-30"])).toBeNull();
+    expect(parseExceptionsInput_([{}])).toBeNull();
+  });
+});
+
 describe("doPost rules", () => {
   const post = (body) => doPost({ postData: { contents: JSON.stringify(body) } });
   const auth = { idToken: "dummy-token" };
@@ -722,7 +746,7 @@ describe("doPost rules", () => {
   });
 
   it("reports last_fired for a rule that already fired", () => {
-    rulesValues.push(["r9", "19:30", "0,1,2,3,4,5,6", "", "20261102", "/a"]);
+    rulesValues.push(["r9", "19:30", "0,1,2,3,4,5,6", "", "20261102", "", "/a"]);
     post({ ...auth, action: "list_rules" });
     const rules = resultJson().rules;
     expect(rules).toHaveLength(1);
@@ -751,9 +775,54 @@ describe("doPost rules", () => {
     expect(resultJson().rule.until).toBe("29991231");
   });
 
+  it("accepts exception dates, stores them, and lists them back", () => {
+    post({
+      ...auth,
+      action: "set_rule",
+      time: "07:00",
+      weekdays: [1, 2, 3, 4, 5],
+      exceptions: ["2027-01-01", "20261225", "2026-12-25"],
+      commands: ["/a"],
+    });
+    const created = resultJson();
+    expect(created.ok).toBe(true);
+    expect(created.rule.exceptions).toEqual(["20261225", "20270101"]);
+    expect(rulesValues[1][5]).toBe("20261225,20270101");
+    post({ ...auth, action: "list_rules" });
+    expect(resultJson().rules[0].exceptions).toEqual(["20261225", "20270101"]);
+  });
+
+  it("rejects an exception date that is not a real date", () => {
+    post({ ...auth, action: "set_rule", time: "07:00", exceptions: ["2026-02-30"], commands: ["/a"] });
+    expect(resultJson().ok).toBe(false);
+    expect(rulesValues).toHaveLength(1);
+  });
+
+  it("replaces exception dates in place with set_rule_exceptions", () => {
+    post({ ...auth, action: "set_rule", time: "07:00", commands: ["/a"] });
+    const id = resultJson().rule.id;
+    post({ ...auth, action: "set_rule_exceptions", id, exceptions: ["2026-12-25"] });
+    expect(resultJson().ok).toBe(true);
+    expect(resultJson().rule.exceptions).toEqual(["20261225"]);
+    expect(rulesValues[1][5]).toBe("20261225");
+    post({ ...auth, action: "set_rule_exceptions", id, exceptions: [] });
+    expect(resultJson().rule.exceptions).toEqual([]);
+    expect(rulesValues[1][5]).toBe("");
+  });
+
+  it("set_rule_exceptions rejects unknown ids and bad dates", () => {
+    post({ ...auth, action: "set_rule_exceptions", id: "nope", exceptions: [] });
+    expect(resultJson().ok).toBe(false);
+    post({ ...auth, action: "set_rule", time: "07:00", commands: ["/a"] });
+    const id = resultJson().rule.id;
+    post({ ...auth, action: "set_rule_exceptions", id, exceptions: ["not-a-date"] });
+    expect(resultJson().ok).toBe(false);
+    expect(rulesValues[1][5]).toBe("");
+  });
+
   it("enforces the rule limit", () => {
     for (let i = 0; i < 256; i += 1) {
-      rulesValues.push([`id-${i}`, "07:00", "0,1,2,3,4,5,6", "", "", "/a"]);
+      rulesValues.push([`id-${i}`, "07:00", "0,1,2,3,4,5,6", "", "", "", "/a"]);
     }
     post({ ...auth, action: "set_rule", time: "07:00", commands: ["/a"] });
     expect(resultJson().ok).toBe(false);
@@ -795,6 +864,9 @@ describe("doPost sync token", () => {
     expect(resultJson().status).toBe(403);
     post({ ...sync, action: "issue_share" });
     expect(resultJson().ok).toBe(false);
+    post({ ...sync, action: "set_rule_exceptions", id: "x", exceptions: [] });
+    expect(resultJson().ok).toBe(false);
+    expect(resultJson().status).toBe(403);
   });
 });
 
@@ -802,7 +874,7 @@ describe("processRules_", () => {
   const monday = new Date(2026, 10, 2, 7, 30, 10); // 2026-11-02 is a Monday
 
   it("fires a due rule once and marks last_fired", () => {
-    rulesValues.push(["r1", "07:30", "0,1,2,3,4,5,6", "", "", "/hue/lights/off"]);
+    rulesValues.push(["r1", "07:30", "0,1,2,3,4,5,6", "", "", "", "/hue/lights/off"]);
     processRules_(monday);
     expect(fetched).toEqual(["http://home-api.example/hue/lights/off"]);
     expect(rulesValues[1][4]).toBe("202611020730");
@@ -811,14 +883,14 @@ describe("processRules_", () => {
   });
 
   it("does not refire a rule whose last_fired is today, in either format", () => {
-    rulesValues.push(["r1", "07:30", "0,1,2,3,4,5,6", "", "202611020700", "/a"]);
-    rulesValues.push(["r2", "07:30", "0,1,2,3,4,5,6", "", "20261102", "/b"]);
+    rulesValues.push(["r1", "07:30", "0,1,2,3,4,5,6", "", "202611020700", "", "/a"]);
+    rulesValues.push(["r2", "07:30", "0,1,2,3,4,5,6", "", "20261102", "", "/b"]);
     processRules_(monday);
     expect(fetched).toHaveLength(0);
   });
 
   it("does not fire on an inactive weekday or outside the window", () => {
-    rulesValues.push(["r1", "07:30", "2,3,4,5,6", "", "", "/a"]); // Mondays off
+    rulesValues.push(["r1", "07:30", "2,3,4,5,6", "", "", "", "/a"]); // Mondays off
     processRules_(monday);
     expect(fetched).toHaveLength(0);
     rulesValues[1][2] = "0,1,2,3,4,5,6";
@@ -827,10 +899,31 @@ describe("processRules_", () => {
   });
 
   it("deletes rules past their until date", () => {
-    rulesValues.push(["r1", "07:30", "0,1,2,3,4,5,6", "20261101", "", "/a"]);
+    rulesValues.push(["r1", "07:30", "0,1,2,3,4,5,6", "20261101", "", "", "/a"]);
     processRules_(monday);
     expect(rulesValues).toHaveLength(1);
     expect(fetched).toHaveLength(0);
+  });
+
+  it("does not fire on an exception date, but fires on other days", () => {
+    rulesValues.push(["r1", "07:30", "0,1,2,3,4,5,6", "", "", "20261102", "/a"]);
+    processRules_(monday);
+    expect(fetched).toHaveLength(0);
+    rulesValues[1][5] = "20261109";
+    processRules_(monday);
+    expect(fetched).toEqual(["http://home-api.example/a"]);
+  });
+
+  it("migrates a sheet laid out before the exceptions column existed", () => {
+    rulesValues = [
+      ["id", "time", "weekdays", "until", "last_fired", "commands"],
+      ["r1", "07:30", "0,1,2,3,4,5,6", "", "", "/a"],
+    ];
+    processRules_(monday);
+    expect(rulesValues[0][5]).toBe("exceptions");
+    expect(rulesValues[1][6]).toBe("/a");
+    expect(fetched).toEqual(["http://home-api.example/a"]);
+    expect(rulesValues[1][4]).toBe("202611020730");
   });
 
   it("does nothing when the rules sheet does not exist", () => {

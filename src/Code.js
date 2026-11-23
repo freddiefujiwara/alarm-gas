@@ -93,8 +93,10 @@
 //   { action: "delete", time } -> remove the alarm for that minute.
 //   { action: "list_rules" }   -> the recurring rules.
 //   { action: "set_rule", time, weekdays | exclude_weekdays,
-//     until?, commands | text }
+//     until?, exceptions?, commands | text }
 //                        -> add a recurring rule (at most MAX_RULES).
+//   { action: "set_rule_exceptions", id, exceptions }
+//                        -> replace one rule's exception dates in place.
 //   { action: "delete_rule", id } -> remove one recurring rule.
 //   { action: "issue_share" }  -> issue a temporary access link.
 //   { action: "revoke_share" } -> revoke the active access links.
@@ -107,8 +109,10 @@
 // demand, with a header row): id, time of day ("HH:MM"), weekdays
 // (comma-separated active days, 0 = Sunday; empty means every day),
 // until ("YYYYMMDD", empty means no end), last_fired ("YYYYMMDDHHMM"),
-// then up to 10 commands. The every-minute trigger fires a rule when
-// today is an active day within the fire window, marks last_fired so
+// exceptions (comma-separated "YYYYMMDD" dates on which the rule
+// does not fire, empty means none), then up to 10 commands. The
+// every-minute trigger fires a rule when today is an active day and
+// not an exception date within the fire window, marks last_fired so
 // it cannot fire twice, and deletes rules whose until date has passed.
 //
 // A request for a datetime that already exists overwrites that row.
@@ -585,6 +589,16 @@ export const collectBodyCommands_ = (body, target) => {
   return cmds;
 };
 
+// Only a string id, or a number (Sheets stores a bare id as a
+// number), names a rule; anything else is not an id at all, so an
+// array wrapping an id cannot name that rule by coercion.
+export const bodyRuleId_ = (body) =>
+  typeof body.id === 'string'
+    ? body.id.trim()
+    : typeof body.id === 'number'
+      ? String(body.id)
+      : '';
+
 const jsonOut_ = (payload) => {
   const output = ContentService.createTextOutput();
   output.setMimeType(ContentService.MimeType.JSON);
@@ -707,19 +721,27 @@ export const doPost = (e) => {
   }
 
   if (body.action === 'delete_rule') {
-    // Only a string id, or a number (Sheets stores a bare id as a
-    // number), names a rule; anything else is not an id at all, so an
-    // array wrapping an id cannot delete that rule by coercion.
-    const id =
-      typeof body.id === 'string'
-        ? body.id.trim()
-        : typeof body.id === 'number'
-          ? String(body.id)
-          : '';
+    const id = bodyRuleId_(body);
     if (!id) {
       return jsonOut_({ ok: false, error: 'missing rule id' });
     }
     return jsonOut_(out({ ok: true, deleted: deleteRule_(id) ? 1 : 0 }));
+  }
+
+  if (body.action === 'set_rule_exceptions') {
+    const id = bodyRuleId_(body);
+    if (!id) {
+      return jsonOut_({ ok: false, error: 'missing rule id' });
+    }
+    const exceptions = parseExceptionsInput_(body.exceptions);
+    if (exceptions === null) {
+      return jsonOut_({ ok: false, error: 'invalid exceptions: use YYYY-MM-DD dates' });
+    }
+    const rule = updateRuleExceptions_(id, exceptions);
+    if (!rule) {
+      return jsonOut_({ ok: false, error: 'rule not found' });
+    }
+    return jsonOut_(out({ ok: true, rule: serializeRule_(rule) }));
   }
 
   if (body.action === 'set_rule') {
@@ -750,6 +772,10 @@ export const doPost = (e) => {
     if (until && until < formatDateKey_(new Date())) {
       return jsonOut_({ ok: false, error: 'until date is in the past' });
     }
+    const exceptions = parseExceptionsInput_(body.exceptions);
+    if (exceptions === null) {
+      return jsonOut_({ ok: false, error: 'invalid exceptions: use YYYY-MM-DD dates' });
+    }
     const target = new Date();
     target.setHours(time.hour, time.minute, 0, 0);
     const commands = collectBodyCommands_(body, target);
@@ -762,6 +788,7 @@ export const doPost = (e) => {
       minute: time.minute,
       weekdays,
       until,
+      exceptions,
       lastFired: '',
       commands,
     };
@@ -811,13 +838,27 @@ export const fireCells_ = (target, cells) => {
 
 // --- Recurring rules ---
 // A rule fires at a fixed time of day on its active weekdays, with an
-// optional end date. Rules are stored in their own sheet so the
-// one-shot sheet keeps its self-cleaning shape.
+// optional end date and optional exception dates. Rules are stored in
+// their own sheet so the one-shot sheet keeps its self-cleaning shape.
 
 const RULES_SHEET_NAME = 'rules';
 const MAX_RULES = 256;
 const ALL_WEEKDAYS_ = [0, 1, 2, 3, 4, 5, 6];
-const RULES_HEADERS = ['id', 'time', 'weekdays', 'until', 'last_fired', 'commands'];
+const RULES_HEADERS = ['id', 'time', 'weekdays', 'until', 'last_fired', 'exceptions', 'commands'];
+
+// Sheets created before the exceptions column existed have "commands"
+// in the header cell where "exceptions" now belongs. Insert the
+// column once, in place, so stored rows keep their meaning; a header
+// that already names the column (or a sheet with no rows at all) is
+// left alone.
+export const ensureRulesLayout_ = (sheet) => {
+  const values = sheet.getDataRange().getValues();
+  if (values.length === 0) return;
+  if (cellText_(values[0][5]).trim() === 'commands') {
+    sheet.insertColumnBefore(6);
+    sheet.getRange(1, 6).setValue('exceptions');
+  }
+};
 
 export const getRulesSheet_ = () => {
   const spreadsheet = spreadsheet_();
@@ -826,6 +867,8 @@ export const getRulesSheet_ = () => {
   if (!sheet) {
     sheet = spreadsheet.insertSheet(name);
     sheet.appendRow(RULES_HEADERS);
+  } else {
+    ensureRulesLayout_(sheet);
   }
   return sheet;
 };
@@ -923,6 +966,58 @@ export const parseLastFired_ = (value) => {
   return digits;
 };
 
+// An exceptions cell -> a sorted array of "YYYYMMDD" date keys.
+// Accepts a comma-separated string, a single Date (Sheets may turn
+// one bare date into a date value), an 8-digit number, or an array
+// of any of those. Entries that are not real dates are dropped: the
+// cell is user-editable, and a typo there must not make the whole
+// rule unreadable.
+export const parseExceptionDates_ = (value) => {
+  if (value == null || value === '') return [];
+  let items;
+  if (Array.isArray(value)) {
+    items = value;
+  } else if (typeof value === 'string') {
+    items = value.split(',');
+  } else if (value instanceof Date || typeof value === 'number') {
+    items = [value];
+  } else {
+    return [];
+  }
+  const keys = [];
+  for (const item of items) {
+    if (typeof item === 'string' && item.trim() === '') continue;
+    const key = parseDateKey_(item);
+    if (key && !keys.includes(key)) keys.push(key);
+  }
+  return keys.sort();
+};
+
+// The set_rule / set_rule_exceptions "exceptions" input -> a sorted
+// array of "YYYYMMDD" keys, or null when any entry is not a real
+// date (the API rejects a typo instead of silently dropping it).
+export const parseExceptionsInput_ = (value) => {
+  if (value == null || value === '') return [];
+  let items;
+  if (Array.isArray(value)) {
+    items = value;
+  } else if (typeof value === 'string') {
+    items = value.split(',');
+  } else if (typeof value === 'number') {
+    items = [value];
+  } else {
+    return null;
+  }
+  const keys = [];
+  for (const item of items) {
+    if (typeof item === 'string' && item.trim() === '') continue;
+    const key = parseDateKey_(item);
+    if (!key) return null;
+    if (!keys.includes(key)) keys.push(key);
+  }
+  return keys.sort();
+};
+
 // A rule row's time cell: a "HH:MM" string, or a Date (Sheets turns
 // "7:30" into a time value on a 1899 date; only the clock matters).
 export const parseRuleTimeCell_ = (value) => {
@@ -945,11 +1040,12 @@ export const rowToRule_ = (row) => {
   const until = parseDateKey_(row[3]);
   if (until === null) return null;
   const lastFired = parseLastFired_(row[4]);
+  const exceptions = parseExceptionDates_(row[5]);
   const commands = row
-    .slice(5)
+    .slice(6)
     .map((c) => cellText_(c).trim())
     .filter((c) => c.length > 0);
-  return { id, hour: time.hour, minute: time.minute, weekdays, until, lastFired, commands };
+  return { id, hour: time.hour, minute: time.minute, weekdays, until, lastFired, exceptions, commands };
 };
 
 export const serializeRule_ = (rule) => ({
@@ -957,6 +1053,8 @@ export const serializeRule_ = (rule) => ({
   time: formatTimeOfDay_(rule.hour, rule.minute),
   weekdays: rule.weekdays,
   until: rule.until || null,
+  // Dates ("YYYYMMDD") on which the rule does not fire.
+  exceptions: rule.exceptions || [],
   // Exposed so callers can confirm when a rule actually fired
   // ("YYYYMMDDHHMM"; rows last fired by older versions hold the
   // date-only "YYYYMMDD". Null when it never fired.)
@@ -991,6 +1089,7 @@ export const addRule_ = (rule) => {
       rule.weekdays.join(','),
       rule.until || '',
       '',
+      (rule.exceptions || []).join(','),
       ...rule.commands,
     ]);
   } finally {
@@ -1017,15 +1116,40 @@ export const deleteRule_ = (id) => {
   }
 };
 
+// Replace one rule's exception dates in place (the rest of the rule,
+// including last_fired, is untouched). Returns the updated rule, or
+// null when no rule has this id.
+export const updateRuleExceptions_ = (id, exceptions) => {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    const sheet = getRulesSheet_();
+    const values = sheet.getDataRange().getValues();
+    for (let i = 1; i < values.length; i++) {
+      if (String(values[i][0] == null ? '' : values[i][0]).trim() === id) {
+        sheet.getRange(i + 1, 6).setValue(exceptions.join(','));
+        const rule = rowToRule_(values[i]);
+        if (rule) rule.exceptions = exceptions.slice();
+        return rule;
+      }
+    }
+    return null;
+  } finally {
+    lock.releaseLock();
+  }
+};
+
 // Fire the rules that are due today. Called from the every-minute
-// trigger: a rule fires when today is one of its weekdays, the clock
-// is inside the fire window, and it has not fired today yet
-// (last_fired guards against the two trigger runs inside the
-// window). Rules past their until date are deleted.
+// trigger: a rule fires when today is one of its weekdays, today is
+// not one of its exception dates, the clock is inside the fire
+// window, and it has not fired today yet (last_fired guards against
+// the two trigger runs inside the window). Rules past their until
+// date are deleted.
 export const processRules_ = (now) => {
   const spreadsheet = spreadsheet_();
   const sheet = spreadsheet.getSheetByName(rulesSheetName_());
   if (!sheet) return;
+  ensureRulesLayout_(sheet);
   const values = sheet.getDataRange().getValues();
   const todayKey = formatDateKey_(now);
   const deleteRows = [];
@@ -1043,6 +1167,7 @@ export const processRules_ = (now) => {
       return;
     }
     if (!rule.weekdays.includes(now.getDay())) return;
+    if (rule.exceptions.includes(todayKey)) return;
     if (rule.lastFired.startsWith(todayKey)) return;
     const target = new Date(now.getFullYear(), now.getMonth(), now.getDate(), rule.hour, rule.minute, 0);
     if (classify_(target, now) !== 'fire') return;
