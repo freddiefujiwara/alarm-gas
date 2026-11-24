@@ -97,6 +97,11 @@
 //                        -> add a recurring rule (at most MAX_RULES).
 //   { action: "set_rule_exceptions", id, exceptions }
 //                        -> replace one rule's exception dates in place.
+//   { action: "update_rule", id, time?, weekdays? | exclude_weekdays?,
+//     until?, exceptions?, commands? | text? }
+//                        -> rewrite one rule in place; omitted fields
+//                           keep their values, and last_fired is reset
+//                           only when the time of day changes.
 //   { action: "delete_rule", id } -> remove one recurring rule.
 //   { action: "issue_share" }  -> issue a temporary access link.
 //   { action: "revoke_share" } -> revoke the active access links.
@@ -744,6 +749,23 @@ export const doPost = (e) => {
     return jsonOut_(out({ ok: true, rule: serializeRule_(rule) }));
   }
 
+  if (body.action === 'update_rule') {
+    const id = bodyRuleId_(body);
+    if (!id) {
+      return jsonOut_({ ok: false, error: 'missing rule id' });
+    }
+    let rule;
+    try {
+      rule = updateRuleFromBody_(id, body);
+    } catch (err) {
+      return jsonOut_({ ok: false, error: err.message });
+    }
+    if (!rule) {
+      return jsonOut_({ ok: false, error: 'rule not found' });
+    }
+    return jsonOut_(out({ ok: true, rule: serializeRule_(rule) }));
+  }
+
   if (body.action === 'set_rule') {
     const time = parseTimeOfDay_(body.time || '');
     if (!time) {
@@ -1132,6 +1154,113 @@ export const updateRuleExceptions_ = (id, exceptions) => {
         if (rule) rule.exceptions = exceptions.slice();
         return rule;
       }
+    }
+    return null;
+  } finally {
+    lock.releaseLock();
+  }
+};
+
+// Rewrite one rule in place from an update_rule body. Fields the
+// body omits keep their current values; validation mirrors set_rule
+// and invalid input throws. last_fired is cleared only when the time
+// of day changes, so an edited rule neither double-fires nor misses
+// its new time today. Returns the updated rule, or null when no rule
+// has this id (or the matching row no longer parses).
+export const updateRuleFromBody_ = (id, body) => {
+  const lock = LockService.getScriptLock();
+  lock.waitLock(10000);
+  try {
+    const sheet = getRulesSheet_();
+    const values = sheet.getDataRange().getValues();
+    for (let i = 1; i < values.length; i++) {
+      if (String(values[i][0] == null ? '' : values[i][0]).trim() !== id) continue;
+      const rule = rowToRule_(values[i]);
+      if (!rule) return null;
+
+      let hour = rule.hour;
+      let minute = rule.minute;
+      if (body.time != null && body.time !== '') {
+        const time = parseTimeOfDay_(body.time);
+        if (!time) throw new Error('invalid time format: use HH:MM');
+        hour = time.hour;
+        minute = time.minute;
+      }
+
+      let weekdays = rule.weekdays;
+      if (body.exclude_weekdays != null) {
+        const excluded = parseWeekdays_(body.exclude_weekdays);
+        if (!excluded) {
+          throw new Error('invalid exclude_weekdays: use day numbers 0-6');
+        }
+        weekdays = ALL_WEEKDAYS_.filter((d) => !excluded.includes(d));
+        if (weekdays.length === 0) throw new Error('no active weekdays left');
+      } else if (body.weekdays !== undefined) {
+        weekdays = parseWeekdays_(body.weekdays);
+        if (!weekdays) {
+          throw new Error('invalid weekdays: use day numbers 0-6');
+        }
+      }
+
+      let until = rule.until;
+      if (body.until !== undefined) {
+        until = parseDateKey_(body.until);
+        if (until === null) {
+          throw new Error('invalid until date: use YYYYMMDD');
+        }
+        if (until && until < formatDateKey_(new Date())) {
+          throw new Error('until date is in the past');
+        }
+      }
+
+      let exceptions = rule.exceptions || [];
+      if (body.exceptions !== undefined) {
+        exceptions = parseExceptionsInput_(body.exceptions);
+        if (exceptions === null) {
+          throw new Error('invalid exceptions: use YYYY-MM-DD dates');
+        }
+      }
+
+      let commands = rule.commands;
+      if (body.commands !== undefined || body.text !== undefined) {
+        if (Array.isArray(body.commands)) {
+          commands = body.commands
+            .map((c) => cellText_(c).trim())
+            .filter((c) => c.length > 0);
+          if (commands.length === 0) {
+            throw new Error('commands must not be empty');
+          }
+        } else {
+          const target = new Date();
+          target.setHours(hour, minute, 0, 0);
+          commands = collectBodyCommands_(body, target);
+        }
+        if (commands.length > MAX_COMMANDS) {
+          throw new Error(`too many commands: max is ${MAX_COMMANDS}`);
+        }
+      }
+
+      const rowNumber = i + 1;
+      const timeChanged = hour !== rule.hour || minute !== rule.minute;
+      sheet.getRange(rowNumber, 2).setValue(formatTimeOfDay_(hour, minute));
+      sheet.getRange(rowNumber, 3).setValue(weekdays.join(','));
+      sheet.getRange(rowNumber, 4).setValue(until);
+      if (timeChanged) sheet.getRange(rowNumber, 5).setValue('');
+      sheet.getRange(rowNumber, 6).setValue(exceptions.join(','));
+      const width = Math.max(rule.commands.length, commands.length);
+      for (let c = 0; c < width; c++) {
+        sheet.getRange(rowNumber, 7 + c).setValue(commands[c] || '');
+      }
+      return {
+        id: rule.id,
+        hour,
+        minute,
+        weekdays,
+        until,
+        lastFired: timeChanged ? '' : rule.lastFired,
+        exceptions,
+        commands,
+      };
     }
     return null;
   } finally {
