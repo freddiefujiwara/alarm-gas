@@ -68,15 +68,20 @@ const mockShareSheet = {
 
 let rulesValues;
 let rulesSheetExists;
+let rulesFormats;
 
 const mockRulesSheet = {
   getDataRange: vi.fn(() => ({ getValues: vi.fn(() => rulesValues) })),
   appendRow: vi.fn((row) => rulesValues.push([...row])),
   deleteRow: vi.fn((n) => rulesValues.splice(n - 1, 1)),
+  getLastRow: vi.fn(() => rulesValues.length),
   insertColumnBefore: vi.fn((col) => {
     rulesValues.forEach((row) => row.splice(col - 1, 0, ""));
   }),
   getRange: vi.fn((row, col) => ({
+    setNumberFormat: vi.fn((format) => {
+      rulesFormats.push([row, col, format]);
+    }),
     setValue: vi.fn((value) => {
       rulesValues[row - 1][col - 1] = value;
     }),
@@ -200,6 +205,7 @@ beforeEach(() => {
   ];
   rulesSheetExists = true;
   rulesValues = [["id", "time", "weekdays", "until", "last_fired", "exceptions", "commands"]];
+  rulesFormats = [];
   tokenInfo = {
     code: 200,
     payload: {
@@ -788,6 +794,10 @@ describe("doPost rules", () => {
     expect(created.ok).toBe(true);
     expect(created.rule.exceptions).toEqual(["20261225", "20270101"]);
     expect(rulesValues[1][5]).toBe("20261225,20270101");
+    // The exceptions cell is written as plain text: as a number,
+    // Sheets would read "20261225,20270101" back as one float and
+    // both dates would be lost.
+    expect(rulesFormats).toContainEqual([2, 6, "@"]);
     post({ ...auth, action: "list_rules" });
     expect(resultJson().rules[0].exceptions).toEqual(["20261225", "20270101"]);
   });
@@ -801,10 +811,13 @@ describe("doPost rules", () => {
   it("replaces exception dates in place with set_rule_exceptions", () => {
     post({ ...auth, action: "set_rule", time: "07:00", commands: ["/a"] });
     const id = resultJson().rule.id;
-    post({ ...auth, action: "set_rule_exceptions", id, exceptions: ["2026-12-25"] });
+    post({ ...auth, action: "set_rule_exceptions", id, exceptions: ["2026-12-25", "2027-01-01"] });
     expect(resultJson().ok).toBe(true);
-    expect(resultJson().rule.exceptions).toEqual(["20261225"]);
-    expect(rulesValues[1][5]).toBe("20261225");
+    expect(resultJson().rule.exceptions).toEqual(["20261225", "20270101"]);
+    expect(rulesValues[1][5]).toBe("20261225,20270101");
+    expect(rulesFormats).toContainEqual([2, 6, "@"]);
+    post({ ...auth, action: "list_rules" });
+    expect(resultJson().rules[0].exceptions).toEqual(["20261225", "20270101"]);
     post({ ...auth, action: "set_rule_exceptions", id, exceptions: [] });
     expect(resultJson().rule.exceptions).toEqual([]);
     expect(rulesValues[1][5]).toBe("");
@@ -836,6 +849,8 @@ describe("doPost rules", () => {
     expect(res.rule.exceptions).toEqual(["20261225"]);
     expect(res.rule.commands).toEqual(["/a", "/b"]);
     expect(rulesValues[1][1]).toBe("08:15");
+    expect(rulesValues[1][5]).toBe("20261225");
+    expect(rulesFormats).toContainEqual([2, 6, "@"]);
   });
 
   it("update_rule resets last_fired only when the time changes", () => {

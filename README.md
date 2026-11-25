@@ -140,6 +140,9 @@ rule does not fire on those dates. The `set_rule_exceptions` action
 without recreating the rule. Exception dates are stored in the rules
 sheet's `exceptions` column (comma-separated `YYYYMMDD`); sheets laid
 out before that column existed are migrated in place on first use.
+The cell is always written with a plain-text number format: as a
+number, Sheets would interpret `20261127,20261128` as a
+thousands-separated value and the dates would be lost on read-back.
 The `update_rule` action (`{ id, ... }`) rewrites one rule in place:
 any of `time`, `weekdays` / `exclude_weekdays`, `until`, `exceptions`
 and `commands` / `text` may be given, omitted fields keep their

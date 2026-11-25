@@ -50,9 +50,11 @@ const dataSheet = (get, onAppend) => ({
   insertColumnBefore: vi.fn((col) => {
     get().forEach((row) => row.splice(col - 1, 0, ""));
   }),
+  getLastRow: vi.fn(() => get().length),
   getRange: vi.fn((row, col) => ({
     clearContent: vi.fn(),
     setValues: vi.fn(),
+    setNumberFormat: vi.fn(),
     setValue: vi.fn((value) => {
       get()[row - 1][col - 1] = value;
     }),
