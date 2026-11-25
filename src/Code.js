@@ -1097,6 +1097,21 @@ export const readRules_ = () => {
   return rules;
 };
 
+// Write one rule's exceptions cell as plain text. The stored form
+// is comma-separated "YYYYMMDD" keys, which Sheets would otherwise
+// interpret on write as a thousands-separated number (the sheet is
+// en_US): "20261127,20261128" came back as the float
+// 2026112720261120.0, its digits no longer any real date, and both
+// exception dates were lost. Forcing the plain-text format first
+// keeps the cell the string that was written. (A single date
+// survived only because an 8-digit number still parses as a date
+// key on read.)
+const setExceptionsCell_ = (sheet, rowNumber, exceptions) => {
+  const cell = sheet.getRange(rowNumber, 6);
+  cell.setNumberFormat('@');
+  cell.setValue((exceptions || []).join(','));
+};
+
 // Append a rule. Throws when the rule limit has been reached.
 export const addRule_ = (rule) => {
   const lock = LockService.getScriptLock();
@@ -1105,7 +1120,8 @@ export const addRule_ = (rule) => {
     if (readRules_().length >= MAX_RULES) {
       throw new Error(`too many rules: max is ${MAX_RULES}`);
     }
-    getRulesSheet_().appendRow([
+    const sheet = getRulesSheet_();
+    sheet.appendRow([
       rule.id,
       formatTimeOfDay_(rule.hour, rule.minute),
       rule.weekdays.join(','),
@@ -1114,6 +1130,9 @@ export const addRule_ = (rule) => {
       (rule.exceptions || []).join(','),
       ...rule.commands,
     ]);
+    // appendRow interprets cell text like user input, so rewrite
+    // the exceptions cell of the appended row as plain text.
+    setExceptionsCell_(sheet, sheet.getLastRow(), rule.exceptions);
   } finally {
     lock.releaseLock();
   }
@@ -1149,7 +1168,7 @@ export const updateRuleExceptions_ = (id, exceptions) => {
     const values = sheet.getDataRange().getValues();
     for (let i = 1; i < values.length; i++) {
       if (String(values[i][0] == null ? '' : values[i][0]).trim() === id) {
-        sheet.getRange(i + 1, 6).setValue(exceptions.join(','));
+        setExceptionsCell_(sheet, i + 1, exceptions);
         const rule = rowToRule_(values[i]);
         if (rule) rule.exceptions = exceptions.slice();
         return rule;
@@ -1246,7 +1265,7 @@ export const updateRuleFromBody_ = (id, body) => {
       sheet.getRange(rowNumber, 3).setValue(weekdays.join(','));
       sheet.getRange(rowNumber, 4).setValue(until);
       if (timeChanged) sheet.getRange(rowNumber, 5).setValue('');
-      sheet.getRange(rowNumber, 6).setValue(exceptions.join(','));
+      setExceptionsCell_(sheet, rowNumber, exceptions);
       const width = Math.max(rule.commands.length, commands.length);
       for (let c = 0; c < width; c++) {
         sheet.getRange(rowNumber, 7 + c).setValue(commands[c] || '');
